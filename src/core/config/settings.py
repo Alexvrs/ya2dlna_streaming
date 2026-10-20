@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     owntone_default_zone: str | None = None
     # Потолок громкости: выше не поднимется ни из кода, ни с колонки
     owntone_max_volume: int = 40
+    # Колонки, повторяющие громкость ведущей (стереопара MUZO принимает
+    # громкость по AirPlay только ведущей): UPnP-адрес ведущей → связанных,
+    # например {"192.168.1.20": ["192.168.1.21"]}
+    linked_speakers: dict[str, list[str]] = {}
 
     # Mode settings
     debug: bool = False

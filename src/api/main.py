@@ -11,6 +11,7 @@ from core.config.settings import settings
 from core.dependencies.main_di_container import MainDIContainer
 from core.logging.setup import setup_logging
 from main_stream_service.main_stream_manager import MainStreamManager
+from owntone_output.linked_volume import LinkedVolumeMirror
 
 setup_logging("api")
 
@@ -25,8 +26,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.audio_output = container.get(
         AudioOutput  # type: ignore[type-abstract]
     )
+    mirror = LinkedVolumeMirror(settings.linked_speakers)
+    mirror.start()
     logger.info("✅ Зависимости API сервиса инициализированы")
     yield
+    await mirror.stop()
 
 
 app = FastAPI(lifespan=lifespan)
