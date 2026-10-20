@@ -85,6 +85,8 @@ class StreamHandler:
         self._ffmpeg = FfmpegSupervisor(on_restarted=self._reattach_ruark)
         # Метаданные текущего потока для дисплея Ruark: (title, artist)
         self._now_playing: tuple[str, str] = (DEFAULT_STREAM_TITLE, "")
+        # Альбом и обложка — для устройств, которые их показывают (OwnTone)
+        self._now_playing_extra: tuple[str, str] = ("", "")
         # Кодек текущего потока: mp3 | flac | aac (радио)
         self._stream_codec = "mp3"
         # Поколение клиента: новый слушатель вытесняет предыдущего,
@@ -177,6 +179,12 @@ class StreamHandler:
             artist=artist,
             mime_type=self.didl_media_type,
         )
+        set_metadata = getattr(self._ruark_controls, "set_metadata", None)
+        if set_metadata is not None:
+            album, cover = self._now_playing_extra
+            await set_metadata(
+                title=title, artist=artist, album=album, artwork_url=cover
+            )
         await self.execute_with_lock(self._ruark_controls.play)
 
     async def stop_ffmpeg(self) -> None:
@@ -413,9 +421,12 @@ class StreamHandler:
         title: str = "",
         artist: str = "",
         codec: str = "mp3",
+        album: str = "",
+        cover: str = "",
     ) -> None:
         """Запускает потоковую трансляцию и передает её на Ruark."""
         self._now_playing = (title or DEFAULT_STREAM_TITLE, artist)
+        self._now_playing_extra = (album, cover)
         logger.info(
             f"🎶 Начинаем потоковое воспроизведение [{codec}] {yandex_url}"
         )

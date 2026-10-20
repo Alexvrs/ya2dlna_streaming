@@ -36,6 +36,7 @@ class FakeOwnTone:
         self.state = "stop"
         self.volume = 50
         self.queue: list[str] = []
+        self.item_meta: dict[str, dict[str, str]] = {}
         # Громкость, которую колонка «сообщит» после старта (как MUZO)
         self.volume_after_start: int | None = None
 
@@ -49,6 +50,7 @@ class FakeOwnTone:
         app.router.add_put("/api/player/stop", self.put_stop)
         app.router.add_put("/api/queue/clear", self.put_clear)
         app.router.add_post("/api/queue/items/add", self.post_add)
+        app.router.add_put("/api/queue/items/{id}", self.put_item)
         return app
 
     def by_id(self, output_id: str) -> dict[str, Any]:
@@ -91,7 +93,13 @@ class FakeOwnTone:
                 for o in self.outputs:
                     if o["selected"]:
                         o["volume"] = self.volume_after_start
-        return web.json_response({"count": 1})
+        return web.json_response(
+            {"count": 1, "items": [{"id": len(self.queue), "uri": "x"}]}
+        )
+
+    async def put_item(self, request: web.Request) -> web.Response:
+        self.item_meta[request.match_info["id"]] = dict(request.query)
+        return web.Response(status=204)
 
 
 @pytest.fixture(autouse=True)
@@ -294,3 +302,21 @@ async def test_remember_start_volume_unknown_zone(fake, tmp_path):
     ctl = make_controller(fake, tmp_path)
     with pytest.raises(OwnToneZoneError):
         ctl.remember_start_volume("Кухня", 20)
+
+
+async def test_metadata_written_to_queue_item(fake, tmp_path):
+    ctl = make_controller(fake, tmp_path)
+    await ctl.set_av_transport_uri(STREAM_URL, title="Metal Heart")
+    await ctl.set_metadata(
+        title="Metal Heart",
+        artist="Dirkschneider",
+        album="Live",
+        artwork_url="https://avatars.yandex.net/x/400x400",
+    )
+    await ctl.play()
+    assert fake.item_meta["1"] == {
+        "title": "Metal Heart",
+        "artist": "Dirkschneider",
+        "album": "Live",
+        "artwork_url": "https://avatars.yandex.net/x/400x400",
+    }

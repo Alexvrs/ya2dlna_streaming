@@ -2,7 +2,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TypedDict
 
 import aiohttp
 from injector import inject
@@ -39,6 +39,13 @@ RUARK_SILENT_PHRASE = "Руарк не отвечает, возвращаю зв
 STREAM_BROKEN_PHRASE = (
     "Стрим сломался и сам не восстанавливается, загляни в логи"
 )
+
+
+class TrackMeta(TypedDict):
+    """Альбом и обложка трека для дисплеев колонок."""
+
+    album: str
+    cover: str
 
 
 @dataclass
@@ -101,6 +108,7 @@ class MainStreamManager:
         self._shutdown_task: asyncio.Task[None] | None = None
         self._source_cache: dict[str, tuple[TrackSource, float]] = {}
         self._prefetch_tasks: dict[str, asyncio.Task[None]] = {}
+        self._meta_cache: dict[str, tuple[str, str | None]] = {}
 
     @property
     def is_running(self) -> bool:
@@ -354,6 +362,7 @@ class MainStreamManager:
             track_url=radio_url,
             radio=True,
             title=track.title,
+            **(await self._track_meta(track)),
         )
 
     async def _refresh_track_if_unchanged(
@@ -590,6 +599,7 @@ class MainStreamManager:
             title=track.title,
             artist=track.artist,
             codec=source.codec,
+            **(await self._track_meta(track)),
         )
         logger.info(
             f"⏱ Ресинк выполнен за "
@@ -638,6 +648,7 @@ class MainStreamManager:
                 title=track.title,
                 artist=track.artist,
                 codec=codec,
+                **(await self._track_meta(track)),
             )
             logger.info(
                 f"⏱ Переключение на {track.id}: ссылка "
@@ -686,6 +697,7 @@ class MainStreamManager:
                         ),
                         title=track.title,
                         artist=track.artist,
+                        **(await self._track_meta(track)),
                     )
                 else:
                     logger.warning(
@@ -867,6 +879,34 @@ class MainStreamManager:
                 f"поднята до {RUARK_MIN_START_VOLUME}"
             )
 
+    async def _track_meta(self, track: Track) -> TrackMeta:
+        """Альбом и ссылка на обложку трека для дисплеев колонок.
+
+        Обложка — из состояния станции, иначе из API Музыки; альбом —
+        из API Музыки (кешируется по id). Ошибки не мешают стриму.
+        """
+        album, cover = "", track.cover
+        if track.type != "FmRadio" and track.id and track.id != "0":
+            cached = self._meta_cache.get(track.id)
+            if cached is None:
+                try:
+                    cached = await self._yandex_music_api.get_track_meta(
+                        track.id
+                    )
+                except Exception as e:
+                    logger.debug(f"Метаданные трека {track.id}: {e}")
+                    cached = ("", None)
+                if len(self._meta_cache) >= TRACK_SOURCE_CACHE_SIZE:
+                    self._meta_cache.pop(next(iter(self._meta_cache)))
+                self._meta_cache[track.id] = cached
+            album = cached[0]
+            cover = cover or cached[1]
+        if cover:
+            cover = "https://" + cover.split("://")[-1].replace(
+                "%%", "400x400"
+            )
+        return {"album": album, "cover": cover or ""}
+
     async def _send_track_to_stream_server(
         self,
         track_url: str,
@@ -875,6 +915,8 @@ class MainStreamManager:
         title: str = "",
         artist: str = "",
         codec: str = "mp3",
+        album: str = "",
+        cover: str = "",
     ):
         """Отправляет ссылку на трек на стрим сервер.
 
@@ -885,6 +927,8 @@ class MainStreamManager:
             title (str): Название трека для дисплея Ruark.
             artist (str): Исполнитель для дисплея Ruark.
             codec (str): Кодек источника: mp3 или flac.
+            album (str): Альбом для дисплеев колонок.
+            cover (str): Ссылка на обложку.
         """
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -900,6 +944,8 @@ class MainStreamManager:
                         "title": title,
                         "artist": artist,
                         "codec": codec,
+                        "album": album,
+                        "cover": cover,
                     },
                 ) as resp:
                     response = await resp.json()

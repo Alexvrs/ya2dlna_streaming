@@ -15,3 +15,5 @@ class Track:
     # Соседние треки очереди станции (entityInfo) — для предзагрузки
     next_id: str | None = None
     prev_id: str | None = None
+    # Ссылка на обложку из состояния станции (extra.coverURI), с %%
+    cover: str | None = None

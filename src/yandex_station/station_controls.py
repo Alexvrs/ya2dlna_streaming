@@ -147,10 +147,18 @@ class YandexStationControls:
                 playing=bool(player_state.get("playing", False)),
                 next_id=self._neighbor_track_id(entity, "next"),
                 prev_id=self._neighbor_track_id(entity, "prev"),
+                cover=self._cover_uri(player_state),
             )
         except Exception as e:
             logger.error(f"❌ Ошибка при получении текущего трека: {e}")
             return None
+
+    @staticmethod
+    def _cover_uri(player_state: Any) -> str | None:
+        """Ссылка на обложку из extra.coverURI состояния плеера."""
+        extra = player_state.get("extra") if player_state else None
+        cover = extra.get("coverURI") if isinstance(extra, dict) else None
+        return str(cover) if cover else None
 
     @staticmethod
     def _neighbor_track_id(entity: Any, key: str) -> str | None:

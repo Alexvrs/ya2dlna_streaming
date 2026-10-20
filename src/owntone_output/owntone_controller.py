@@ -58,6 +58,8 @@ class OwnToneController:
         self._start_volumes = start_volume_store or StartVolumeStore()
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._stream_url: str | None = None
+        # Метаданные текущего трека для дисплеев (AirPlay, WiiM, Apple TV)
+        self._metadata: dict[str, str] = {}
         # Имя выхода OwnTone → его id (обновляется при каждом запросе)
         self._outputs: dict[str, dict[str, Any]] = {}
         self._recheck_task: asyncio.Task[None] | None = None
@@ -365,7 +367,44 @@ class OwnToneController:
     ) -> None:
         """Запоминает адрес локального стрима для следующего play()."""
         self._stream_url = url
+        self._metadata.update(title=title, artist=artist)
         logger.debug(f"OwnTone: поток {url} ({artist} — {title})")
+
+    async def set_metadata(
+        self,
+        title: str = "",
+        artist: str = "",
+        album: str = "",
+        artwork_url: str = "",
+    ) -> None:
+        """Запоминает метаданные трека для следующего play()."""
+        self._metadata = {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "artwork_url": artwork_url,
+        }
+
+    async def _apply_metadata(self, added: Any) -> None:
+        """Записывает метаданные в элемент очереди OwnTone.
+
+        OwnTone передаёт их по AirPlay: название, исполнитель, альбом
+        и обложка видны в WiiM и на экране Apple TV.
+        """
+        params = {k: v for k, v in self._metadata.items() if v}
+        if not params:
+            return
+        items = added.get("items") if isinstance(added, dict) else None
+        item_id = (
+            items[0].get("id")
+            if items and isinstance(items[0], dict)
+            else None
+        )
+        target = str(item_id) if item_id is not None else "now_playing"
+        try:
+            await self._request("PUT", f"/queue/items/{target}", params=params)
+        except OwnToneError as e:
+            logger.warning(f"⚠️ Метаданные трека не записаны: {e}")
 
     async def play(self) -> None:
         """Выбирает колонки зоны и ставит в OwnTone локальный стрим.
@@ -378,11 +417,12 @@ class OwnToneController:
         ids = await self._apply_zone()
         await self._cap_output_volumes(ids)
         await self._request("PUT", "/queue/clear")
-        await self._request(
+        added = await self._request(
             "POST",
             "/queue/items/add",
             params={"uris": self._stream_url, "playback": "start"},
         )
+        await self._apply_metadata(added)
         if self._recheck_task and not self._recheck_task.done():
             self._recheck_task.cancel()
         self._recheck_task = asyncio.create_task(

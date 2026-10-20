@@ -40,6 +40,23 @@ class YandexMusicAPI:
     def __init__(self, client: ClientAsync):
         self._client = client
 
+    async def get_track_meta(
+        self, track_id: str | int
+    ) -> tuple[str, str | None]:
+        """Альбом и обложка трека (обложка — с %% вместо размера).
+
+        Returns:
+            tuple[str, str | None]: Название альбома и cover_uri.
+        """
+        tracks = await self._client.tracks([track_id])
+        if not tracks:
+            return "", None
+        track = tracks[0]
+        albums = getattr(track, "albums", None) or []
+        album = str(getattr(albums[0], "title", "") or "") if albums else ""
+        cover = getattr(track, "cover_uri", None)
+        return album, str(cover) if cover else None
+
     async def get_track_source(
         self,
         track_id: str | int,

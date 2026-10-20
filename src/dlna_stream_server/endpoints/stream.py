@@ -29,11 +29,20 @@ async def _handle_stream_task(
     title: str = "",
     artist: str = "",
     codec: str = "mp3",
+    album: str = "",
+    cover: str = "",
 ):
     """Обработчик задачи потока с логированием ошибок."""
     try:
         await stream_handler.play_stream(
-            yandex_url, radio, start_position, title, artist, codec
+            yandex_url,
+            radio,
+            start_position,
+            title,
+            artist,
+            codec,
+            album=album,
+            cover=cover,
         )
         logger.info(f"✅ Задача потока {task_id} завершена успешно")
     except Exception as e:
@@ -52,6 +61,8 @@ async def set_stream(
     title: str = "",
     artist: str = "",
     codec: str = "mp3",
+    album: str = "",
+    cover: str = "",
 ):
     """Принимает URL трека и запускает потоковую передачу на Ruark.
 
@@ -85,6 +96,8 @@ async def set_stream(
             title,
             artist,
             codec,
+            album,
+            cover,
         )
     )
     _active_tasks[task_id] = task
