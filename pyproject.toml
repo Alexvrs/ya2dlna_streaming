@@ -9,6 +9,7 @@ dependencies = [
     "injector==0.22.0",
     "pydantic==2.10.6",
     "pydantic-settings==2.8.1",
+    "python-linkplay==0.2.14",
     "upnpclient==1.0.3",
     "uvicorn==0.34.0",
     "yandex-music==3.0.0",
@@ -90,5 +91,5 @@ check_untyped_defs = true
 disallow_any_generics = true
 
 [[tool.mypy.overrides]]
-module = ["upnpclient", "upnpclient.*", "yandex_music", "yandex_music.*"]
+module = ["upnpclient", "upnpclient.*", "yandex_music", "yandex_music.*", "linkplay.*"]
 ignore_missing_imports = true
