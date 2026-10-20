@@ -21,6 +21,16 @@ from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
 REAL_SLEEP = asyncio.sleep
 
 
+@pytest.fixture(autouse=True)
+def no_redirect_lookup(monkeypatch):
+    """Фиктивные адреса тестов не ходят в сеть за перенаправлениями."""
+
+    async def identity(url, *args, **kwargs):
+        return url
+
+    monkeypatch.setattr(stream_handler_module, "resolve_redirects", identity)
+
+
 @pytest.fixture
 def fast_sleep(monkeypatch):
     """Подменяет asyncio.sleep, чтобы задержки рестартов не тормозили тест."""

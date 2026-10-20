@@ -1,10 +1,12 @@
 from injector import Module, provider, singleton
 from yandex_music import ClientAsync
 
+from core.audio_output import AudioOutput
 from core.config.settings import settings
 from dlna_stream_server.handlers.stream_handler import StreamHandler
 from main_stream_service.main_stream_manager import MainStreamManager
 from main_stream_service.yandex_music_api import YandexMusicAPI
+from owntone_output.owntone_controller import OwnToneController
 from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
 from yandex_station.mdns_device_finder import DeviceFinder
 from yandex_station.protobuf_parser import Protobuf
@@ -21,7 +23,7 @@ class MainStreamManagerModule(Module):
         self,
         station_ws_client: YandexStationClient,
         station_controls: YandexStationControls,
-        ruark_controls: RuarkR5Controller,
+        ruark_controls: AudioOutput,
         yandex_music_api: YandexMusicAPI,
     ) -> MainStreamManager:
         return MainStreamManager(
@@ -73,14 +75,19 @@ class YandexMusicAPIModule(Module):
         return YandexMusicAPI(client=client)
 
 
-class RuarkR5ControllerModule(Module):
-    """Класс для управления зависимостями RuarkR5Controller."""
+class AudioOutputModule(Module):
+    """Устройство вывода звука по настройке output_backend."""
 
     @singleton
     @provider
-    def provide_ruark_r5_controller(
-        self,
-    ) -> RuarkR5Controller:
+    def provide_audio_output(self) -> AudioOutput:
+        if settings.output_backend == "owntone":
+            return OwnToneController(
+                base_url=settings.owntone_url,
+                zones=settings.owntone_zones,
+                default_zone=settings.owntone_default_zone,
+                max_volume=settings.owntone_max_volume,
+            )
         return RuarkR5Controller()
 
 
@@ -90,7 +97,7 @@ class StreamHandlerModule(Module):
     @singleton
     @provider
     def provide_stream_handler(
-        self, ruark_controls: RuarkR5Controller
+        self, ruark_controls: AudioOutput
     ) -> StreamHandler:
         return StreamHandler(ruark_controls)
 

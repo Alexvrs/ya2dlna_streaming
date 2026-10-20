@@ -3,9 +3,9 @@ from typing import Optional, Sequence
 from injector import Injector, Module
 
 from core.dependencies.di_modules import (
+    AudioOutputModule,
     DeviceFinderModule,
     MainStreamManagerModule,
-    RuarkR5ControllerModule,
     StreamHandlerModule,
     YandexMusicAPIModule,
     YandexStationClientModule,
@@ -24,7 +24,7 @@ class MainDIContainer:
     BASE_MODULES: list[ModuleSpec] = [
         YandexStationClientModule,
         YandexStationControlsModule,
-        RuarkR5ControllerModule,
+        AudioOutputModule,
         YandexMusicAPIModule,
         MainStreamManagerModule,
         StreamHandlerModule,

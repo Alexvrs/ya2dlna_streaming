@@ -6,6 +6,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from api.endpoints.routers import main_router
+from core.audio_output import AudioOutput
 from core.config.settings import settings
 from core.dependencies.main_di_container import MainDIContainer
 from core.logging.setup import setup_logging
@@ -21,6 +22,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Создание DI-контейнера и менеджера стриминга при старте."""
     container = MainDIContainer().get_container()
     app.state.main_stream_manager = container.get(MainStreamManager)
+    app.state.audio_output = container.get(
+        AudioOutput  # type: ignore[type-abstract]
+    )
     logger.info("✅ Зависимости API сервиса инициализированы")
     yield
 

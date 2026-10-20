@@ -61,6 +61,7 @@ known_first_party = [
     "core",
     "dlna_stream_server",
     "main_stream_service",
+    "owntone_output",
     "ruark_audio_system",
     "yandex_station",
 ]

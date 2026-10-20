@@ -7,10 +7,10 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from injector import inject
 
+from core.audio_output import AudioOutput
 from core.config.settings import settings
 from main_stream_service.yandex_music_api import TrackSource, YandexMusicAPI
 from ruark_audio_system.exceptions import RuarkDeviceNotFoundError
-from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
 from ruark_audio_system.volume_store import RuarkVolumeStore
 from yandex_station.constants import (
     ALICE_ACTIVE_STATES,
@@ -72,7 +72,7 @@ class MainStreamManager:
 
     _ws_client: YandexStationClient
     _station_controls: YandexStationControls
-    _ruark_controls: RuarkR5Controller
+    _ruark_controls: AudioOutput
     _yandex_music_api: YandexMusicAPI
     _stream_state_running: bool
     _stream_server_url: str
@@ -84,7 +84,7 @@ class MainStreamManager:
         self,
         station_ws_client: YandexStationClient,
         station_controls: YandexStationControls,
-        ruark_controls: RuarkR5Controller,
+        ruark_controls: AudioOutput,
         yandex_music_api: YandexMusicAPI,
     ):
 

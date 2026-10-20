@@ -7,10 +7,11 @@ from typing import Any, Awaitable, Callable, Sequence
 import aiohttp
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from yarl import URL
 
+from core.audio_output import AudioOutput
 from core.config.settings import settings
 from ruark_audio_system.constants import DEFAULT_STREAM_TITLE
-from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
 
 from .constants import (
     DIDL_MIME_TYPES,
@@ -46,10 +47,39 @@ def _insert_start_position(
     return result
 
 
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+async def resolve_redirects(
+    url: str, max_hops: int = 5, timeout: float = 5.0
+) -> str:
+    """Проходит HTTP-перенаправления и возвращает конечный адрес.
+
+    Яндекс отдаёт ссылку на трек через 308 Permanent Redirect, который
+    FFmpeg 4.x (Debian 11 / Raspberry Pi OS bullseye) не понимает
+    и читает мусор («Invalid data found»). Конечный адрес FFmpeg
+    открывает любой версии. При любой ошибке возвращается исходный URL.
+    """
+    current = url
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    try:
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            for _ in range(max_hops):
+                async with session.get(current, allow_redirects=False) as resp:
+                    location = resp.headers.get("Location")
+                    if resp.status not in REDIRECT_STATUSES or not location:
+                        return current
+                    current = str(resp.url.join(URL(location)))
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning(f"⚠️ Не удалось пройти перенаправления: {e!r}")
+        return url
+    return current
+
+
 class StreamHandler:
     """Класс для управления потоковой передачей и воспроизведением на Ruark."""
 
-    def __init__(self, ruark_controls: RuarkR5Controller):
+    def __init__(self, ruark_controls: AudioOutput):
         self._ruark_controls = ruark_controls
         self._ruark_lock = asyncio.Lock()
         self._ffmpeg = FfmpegSupervisor(on_restarted=self._reattach_ruark)
@@ -182,7 +212,7 @@ class StreamHandler:
             yandex_url = (
                 await self._download_and_get_local_mp3_path(yandex_url)
                 if settings.stream_is_local_file
-                else yandex_url
+                else await resolve_redirects(yandex_url)
             )
             self._stream_codec = codec if codec == "flac" else "mp3"
             params = _insert_start_position(

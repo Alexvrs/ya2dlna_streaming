@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,10 +32,22 @@ class Settings(BaseSettings):
     local_server_port_dlna: int
     local_server_port_api: int
 
+    # Устройство вывода: ruark (DLNA, Ruark R5) или owntone (AirPlay 2)
+    output_backend: Literal["ruark", "owntone"] = "ruark"
+
     # Ruark R5 settings
-    ruark_pin: str
+    ruark_pin: str = "1234"
     # Известный IP Ruark: быстрый старт без SSDP-скана всей сети
     ruark_host: str | None = None
+
+    # OwnTone settings (output_backend=owntone)
+    owntone_url: str = "http://localhost:3689"
+    # Зоны: имя → имена выходов OwnTone, JSON в .env, например
+    # {"Обитель": ["Колонка"], "Спальня": ["Спальня"]}
+    owntone_zones: dict[str, list[str]] = {}
+    owntone_default_zone: str | None = None
+    # Потолок громкости: выше не поднимется ни из кода, ни с колонки
+    owntone_max_volume: int = 40
 
     # Mode settings
     debug: bool = False
