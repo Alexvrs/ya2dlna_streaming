@@ -193,3 +193,15 @@ def test_manager_reports_running_state():
     assert manager.is_running is False
     manager._stream_state_running = True
     assert manager.is_running is True
+
+
+async def test_start_volume_overrides_saved(monkeypatch):
+    from core.config.settings import settings
+
+    monkeypatch.setattr(settings, "start_volume", 10)
+    manager, ruark = make_manager(ruark_volume=40)
+    manager._volume_store = MagicMock()
+    manager._volume_store.load.return_value = 33
+    await manager._prepare_devices()
+    ruark.set_volume.assert_awaited_with(10)
+    assert manager._ruark_volume == 10

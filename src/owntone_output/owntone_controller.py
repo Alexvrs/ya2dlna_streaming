@@ -54,6 +54,9 @@ class OwnToneController:
         # Имя выхода OwnTone → его id (обновляется при каждом запросе)
         self._outputs: dict[str, dict[str, Any]] = {}
         self._recheck_task: asyncio.Task[None] | None = None
+        # Стартовая громкость, которую надо закрепить после подключения
+        # колонок при первом play() сеанса (колонка может навязать свою)
+        self._pending_start_volume: int | None = None
 
     # ---- HTTP ---------------------------------------------------------
 
@@ -228,14 +231,44 @@ class OwnToneController:
                 )
 
     async def _recheck_volumes_later(self, ids: list[str]) -> None:
-        """Повторно проверяет громкость после подключения колонок."""
+        """Повторно проверяет громкость после подключения колонок.
+
+        Если сеанс только начался — закрепляет стартовую громкость,
+        иначе лишь опускает до потолка.
+        """
         try:
             await asyncio.sleep(VOLUME_RECHECK_DELAY)
-            await self._cap_output_volumes(ids)
+            start = self._pending_start_volume
+            self._pending_start_volume = None
+            if start is not None:
+                await self._set_outputs_volume(ids, start)
+            else:
+                await self._cap_output_volumes(ids)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning(f"⚠️ Повторная проверка громкости не удалась: {e}")
+
+    async def _set_outputs_volume(self, ids: list[str], volume: int) -> None:
+        """Ставит громкость указанным выходам OwnTone."""
+        for output_id in ids:
+            await self._request(
+                "PUT", f"/outputs/{output_id}", json={"volume": volume}
+            )
+
+    async def set_start_volume(self, volume: int) -> None:
+        """Стартовая громкость сеанса: всем колонкам текущей зоны.
+
+        Закрепляется ещё раз после подключения колонок в первом play().
+
+        Raises:
+            OwnToneZoneError: Колонок зоны нет в сети.
+        """
+        target = self._clamp(volume)
+        ids = await self._apply_zone()
+        await self._set_outputs_volume(ids, target)
+        self._pending_start_volume = target
+        logger.info(f"🔊 Стартовая громкость: {target}")
 
     async def get_volume(self) -> int:
         """Общая громкость OwnTone, 0–100."""

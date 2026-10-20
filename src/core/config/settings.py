@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     # принимает громкость только ведущей): IP ведущей → IP связанных,
     # например {"192.168.1.20": ["192.168.1.21"]}
     linked_speakers: dict[str, list[str]] = {}
+    # Громкость при каждом включении стрима, 0–100; не задана — громкость
+    # прошлого сеанса (поведение автора)
+    start_volume: int | None = None
 
     # Mode settings
     debug: bool = False

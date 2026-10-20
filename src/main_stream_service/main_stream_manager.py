@@ -813,6 +813,16 @@ class MainStreamManager:
             return
         self._volume_store.save(self._ruark_volume)
 
+    async def _apply_start_volume(self, volume: int) -> None:
+        """Ставит заданную стартовую громкость вместо прошлого сеанса."""
+        set_start = getattr(self._ruark_controls, "set_start_volume", None)
+        if set_start is not None:
+            await set_start(volume)
+        else:
+            await self._ruark_controls.set_volume(volume)
+        self._ruark_volume = volume
+        logger.info(f"🔊 Стартовая громкость стрима: {volume}")
+
     async def _prepare_devices(self):
         logger.info("🔧 Подготовка устройств к стримингу...")
         # Ждём первое сообщение станции вместо фиксированной паузы:
@@ -822,6 +832,10 @@ class MainStreamManager:
         await self._ruark_controls.get_session_id()
         if await self._ruark_controls.get_power_status() == "0":
             await self._ruark_controls.turn_power_on()
+
+        if settings.start_volume is not None:
+            await self._apply_start_volume(settings.start_volume)
+            return
 
         saved_volume = self._volume_store.load()
         if saved_volume is not None and saved_volume > RUARK_IDLE_VOLUME:

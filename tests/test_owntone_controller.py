@@ -249,3 +249,21 @@ async def test_zone_volume_unknown_zone(fake, tmp_path):
         await ctl.set_zone_volume("Кухня", 10)
     with pytest.raises(OwnToneZoneError):
         await ctl.get_zone_volume("Кухня")
+
+
+async def test_start_volume_applied_and_pinned_after_connect(fake, tmp_path):
+    fake.volume_after_start = 100  # колонка навязывает свою громкость
+    ctl = make_controller(fake, tmp_path)
+    await ctl.set_start_volume(10)
+    assert fake.by_id("1")["volume"] == 10
+    await ctl.set_av_transport_uri(STREAM_URL)
+    await ctl.play()
+    assert ctl._recheck_task is not None
+    await ctl._recheck_task
+    assert fake.by_id("1")["volume"] == 10
+    # Следующий трек сеанса громкость не трогает (только потолок)
+    fake.by_id("1")["volume"] = 25
+    fake.volume_after_start = None
+    await ctl.play()
+    await ctl._recheck_task
+    assert fake.by_id("1")["volume"] == 25
