@@ -230,3 +230,22 @@ async def test_unreachable_owntone(tmp_path):
     assert await ctl.is_playing() is False
     with pytest.raises(OwnToneError):
         await asyncio.wait_for(ctl.get_volume(), 5)
+
+
+async def test_zone_volume_sets_all_zone_outputs_capped(fake, tmp_path):
+    ctl = make_controller(fake, tmp_path)
+    assert await ctl.set_zone_volume("Весь дом", 25) == 25
+    assert fake.by_id("1")["volume"] == 25
+    assert fake.by_id("2")["volume"] == 25
+    # Выше потолка (30) не поднимается
+    assert await ctl.set_zone_volume("Обитель", 80) == 30
+    assert await ctl.get_zone_volume("Обитель") == 30
+    assert fake.by_id("2")["volume"] == 25
+
+
+async def test_zone_volume_unknown_zone(fake, tmp_path):
+    ctl = make_controller(fake, tmp_path)
+    with pytest.raises(OwnToneZoneError):
+        await ctl.set_zone_volume("Кухня", 10)
+    with pytest.raises(OwnToneZoneError):
+        await ctl.get_zone_volume("Кухня")

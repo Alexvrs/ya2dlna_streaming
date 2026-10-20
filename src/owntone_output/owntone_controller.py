@@ -162,6 +162,49 @@ class OwnToneController:
 
     # ---- Громкость ----------------------------------------------------
 
+    async def get_zone_volume(self, zone: str) -> int | None:
+        """Громкость зоны: наибольшая из её колонок, None — колонок нет.
+
+        Raises:
+            OwnToneZoneError: Зона не настроена.
+        """
+        if zone not in self._zones:
+            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        outputs = await self._refresh_outputs()
+        levels = [
+            int(outputs[name].get("volume", 0))
+            for name in self._zones[zone]
+            if name in outputs
+        ]
+        return max(levels) if levels else None
+
+    async def set_zone_volume(self, zone: str, volume: int) -> int:
+        """Ставит громкость всем колонкам зоны (не выше потолка).
+
+        Работает и когда зона не играет: уровень сохранится в OwnTone
+        до следующего включения.
+
+        Returns:
+            int: Установленная громкость.
+        Raises:
+            OwnToneZoneError: Зона не настроена или её колонок нет в сети.
+        """
+        if zone not in self._zones:
+            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        target = self._clamp(volume)
+        outputs = await self._refresh_outputs()
+        ids = [
+            str(outputs[n]["id"]) for n in self._zones[zone] if n in outputs
+        ]
+        if not ids:
+            raise OwnToneZoneError(f"Колонки зоны «{zone}» не найдены")
+        for output_id in ids:
+            await self._request(
+                "PUT", f"/outputs/{output_id}", json={"volume": target}
+            )
+        logger.info(f"🔊 Громкость зоны «{zone}»: {target}")
+        return target
+
     def _clamp(self, volume: int) -> int:
         """Ограничивает громкость диапазоном 0…max_volume."""
         return max(0, min(self._max_volume, int(volume)))

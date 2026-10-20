@@ -42,12 +42,20 @@ async def shutdown(request: Request):
 async def status(request: Request):
     """Состояние стрима: идёт ли и в какой зоне (зона — только OwnTone)."""
     output = request.app.state.audio_output
-    zone = (
-        output.current_zone()
-        if isinstance(output, OwnToneController)
-        else None
-    )
-    return {"running": _get_manager(request).is_running, "zone": zone}
+    zone = None
+    volumes: dict[str, int | None] = {}
+    if isinstance(output, OwnToneController):
+        zone = output.current_zone()
+        for name in output.zones:
+            try:
+                volumes[name] = await output.get_zone_volume(name)
+            except OwnToneError:
+                volumes[name] = None
+    return {
+        "running": _get_manager(request).is_running,
+        "zone": zone,
+        "volumes": volumes,
+    }
 
 
 def _get_owntone(request: Request) -> OwnToneController:
@@ -139,3 +147,16 @@ async def zone_off_endpoint(request: Request, zone: str):
     except OwnToneZoneError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     return {"status": result, "zone": owntone.current_zone()}
+
+
+@router.post("/zone/{zone}/volume/{volume}")
+async def zone_volume(request: Request, zone: str, volume: int):
+    """Громкость колонок зоны, 0–100 (не выше APP_OWNTONE_MAX_VOLUME)."""
+    owntone = _get_owntone(request)
+    try:
+        level = await owntone.set_zone_volume(zone, volume)
+    except OwnToneZoneError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except OwnToneError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return {"status": "volume_set", "zone": zone, "volume": level}
