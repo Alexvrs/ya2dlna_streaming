@@ -102,6 +102,11 @@ class MainStreamManager:
         self._source_cache: dict[str, tuple[TrackSource, float]] = {}
         self._prefetch_tasks: dict[str, asyncio.Task[None]] = {}
 
+    @property
+    def is_running(self) -> bool:
+        """Идёт ли сейчас стриминг."""
+        return self._stream_state_running
+
     async def start(self):
         """Запуск всех стриминговых процессов."""
         if self._stream_state_running or self._tasks:

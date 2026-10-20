@@ -186,3 +186,10 @@ async def test_stop_saves_last_known_volume_when_ruark_unreachable():
     await manager.stop()
 
     manager._volume_store.save.assert_called_once_with(30)
+
+
+def test_manager_reports_running_state():
+    manager, _ = make_manager()
+    assert manager.is_running is False
+    manager._stream_state_running = True
+    assert manager.is_running is True

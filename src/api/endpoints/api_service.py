@@ -38,6 +38,18 @@ async def shutdown(request: Request):
     return {"status": "main_service stopped"}
 
 
+@router.get("/status")
+async def status(request: Request):
+    """Состояние стрима: идёт ли и в какой зоне (зона — только OwnTone)."""
+    output = request.app.state.audio_output
+    zone = (
+        output.current_zone()
+        if isinstance(output, OwnToneController)
+        else None
+    )
+    return {"running": _get_manager(request).is_running, "zone": zone}
+
+
 def _get_owntone(request: Request) -> OwnToneController:
     """Возвращает контроллер OwnTone или 404, если вывод не через OwnTone."""
     output = request.app.state.audio_output
@@ -67,3 +79,63 @@ async def select_zone(request: Request, zone: str):
     except OwnToneError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"status": "zone_selected", "current": owntone.current_zone()}
+
+
+async def zone_on(
+    manager: MainStreamManager, owntone: OwnToneController, zone: str
+) -> str:
+    """Включает стрим в зоне: выбирает её и запускает стрим, если он стоит.
+
+    Повтор для уже играющей зоны ничего не меняет — эхо от синхронизации
+    переключателей (Алиса, Apple Home) безвредно.
+
+    Returns:
+        str: Что сделано: started | switched | unchanged.
+    """
+    previous = owntone.current_zone()
+    await owntone.select_zone(zone)
+    if not manager.is_running:
+        global _start_task
+        _start_task = asyncio.create_task(manager.start())
+        return "started"
+    return "unchanged" if previous == zone else "switched"
+
+
+async def zone_off(
+    manager: MainStreamManager, owntone: OwnToneController, zone: str
+) -> str:
+    """Выключает стрим, только если он играет именно в этой зоне.
+
+    Returns:
+        str: Что сделано: stopped | unchanged.
+    """
+    if zone not in owntone.zones:
+        raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+    if manager.is_running and owntone.current_zone() == zone:
+        await manager.stop()
+        return "stopped"
+    return "unchanged"
+
+
+@router.post("/zone/{zone}/on")
+async def zone_on_endpoint(request: Request, zone: str):
+    """Включает стрим в зоне (для переключателей Алисы и Apple Home)."""
+    owntone = _get_owntone(request)
+    try:
+        result = await zone_on(_get_manager(request), owntone, zone)
+    except OwnToneZoneError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except OwnToneError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return {"status": result, "zone": owntone.current_zone()}
+
+
+@router.post("/zone/{zone}/off")
+async def zone_off_endpoint(request: Request, zone: str):
+    """Выключает стрим, если он играет в этой зоне."""
+    owntone = _get_owntone(request)
+    try:
+        result = await zone_off(_get_manager(request), owntone, zone)
+    except OwnToneZoneError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {"status": result, "zone": owntone.current_zone()}
