@@ -816,12 +816,16 @@ class MainStreamManager:
     async def _apply_start_volume(self, volume: int) -> None:
         """Ставит заданную стартовую громкость вместо прошлого сеанса."""
         set_start = getattr(self._ruark_controls, "set_start_volume", None)
+        applied = volume
         if set_start is not None:
-            await set_start(volume)
+            result = await set_start(volume)
+            # Зона могла получить громкость, выставленную заранее
+            if isinstance(result, int):
+                applied = result
         else:
             await self._ruark_controls.set_volume(volume)
-        self._ruark_volume = volume
-        logger.info(f"🔊 Стартовая громкость стрима: {volume}")
+        self._ruark_volume = applied
+        logger.info(f"🔊 Стартовая громкость стрима: {applied}")
 
     async def _prepare_devices(self):
         logger.info("🔧 Подготовка устройств к стримингу...")

@@ -3,6 +3,7 @@ from logging import getLogger
 
 from fastapi import APIRouter, HTTPException, Request
 
+from core.config.settings import settings
 from main_stream_service.main_stream_manager import MainStreamManager
 from owntone_output.owntone_controller import (
     OwnToneController,
@@ -46,7 +47,14 @@ async def status(request: Request):
     volumes: dict[str, int | None] = {}
     if isinstance(output, OwnToneController):
         zone = output.current_zone()
+        running = _get_manager(request).is_running
         for name in output.zones:
+            # Выключенный стрим: громкость, с которой зона включится
+            if not running and settings.start_volume is not None:
+                volumes[name] = output.next_start_volume(
+                    name, settings.start_volume
+                )
+                continue
             try:
                 volumes[name] = await output.get_zone_volume(name)
             except OwnToneError:
@@ -153,7 +161,17 @@ async def zone_off_endpoint(request: Request, zone: str):
 async def zone_volume(request: Request, zone: str, volume: int):
     """Громкость колонок зоны, 0–100 (не выше APP_OWNTONE_MAX_VOLUME)."""
     owntone = _get_owntone(request)
+    manager = _get_manager(request)
+    playing_here = manager.is_running and owntone.current_zone() == zone
     try:
+        if not playing_here and settings.start_volume is not None:
+            # Стрим в зоне не играет: громкость станет стартовой
+            level = owntone.remember_start_volume(zone, volume)
+            return {
+                "status": "start_volume_set",
+                "zone": zone,
+                "volume": level,
+            }
         level = await owntone.set_zone_volume(zone, volume)
     except OwnToneZoneError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e

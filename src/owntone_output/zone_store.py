@@ -1,3 +1,4 @@
+import json
 from logging import getLogger
 from pathlib import Path
 
@@ -34,3 +35,55 @@ class ZoneStore:
             self._path.write_text(zone, encoding="utf-8")
         except OSError as e:
             logger.warning(f"⚠️ Не удалось сохранить зону: {e}")
+
+
+DEFAULT_START_VOLUME_PATH = Path("cache") / "owntone_start_volume.json"
+
+
+class StartVolumeStore:
+    """Громкость, выставленная при выключенном стриме, по зонам.
+
+    Применяется один раз — при следующем включении стрима в этой зоне.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path or DEFAULT_START_VOLUME_PATH
+
+    def _load(self) -> dict[str, int]:
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            logger.warning(f"⚠️ Не удалось прочитать стартовую громкость: {e}")
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
+
+    def _save(self, data: dict[str, int]) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError as e:
+            logger.warning(f"⚠️ Не удалось сохранить стартовую громкость: {e}")
+
+    def get(self, zone: str) -> int | None:
+        """Запомненная громкость зоны или None."""
+        return self._load().get(zone)
+
+    def put(self, zone: str, volume: int) -> None:
+        """Запоминает громкость для следующего включения зоны."""
+        data = self._load()
+        data[zone] = volume
+        self._save(data)
+
+    def pop(self, zone: str) -> int | None:
+        """Забирает громкость зоны (одноразово)."""
+        data = self._load()
+        volume = data.pop(zone, None)
+        if volume is not None:
+            self._save(data)
+        return volume

@@ -4,7 +4,7 @@ from typing import Any
 
 import aiohttp
 
-from owntone_output.zone_store import ZoneStore
+from owntone_output.zone_store import StartVolumeStore, ZoneStore
 
 logger = getLogger(__name__)
 
@@ -41,6 +41,7 @@ class OwnToneController:
         max_volume: int = 40,
         zone_store: ZoneStore | None = None,
         timeout: float = 10.0,
+        start_volume_store: StartVolumeStore | None = None,
     ) -> None:
         """Сохраняет настройки; связь с OwnTone проверяется в connect()."""
         self.device_name = "OwnTone"
@@ -49,6 +50,7 @@ class OwnToneController:
         self._default_zone = default_zone
         self._max_volume = max(0, min(100, max_volume))
         self._zone_store = zone_store or ZoneStore()
+        self._start_volumes = start_volume_store or StartVolumeStore()
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._stream_url: str | None = None
         # Имя выхода OwnTone → его id (обновляется при каждом запросе)
@@ -256,7 +258,7 @@ class OwnToneController:
                 "PUT", f"/outputs/{output_id}", json={"volume": volume}
             )
 
-    async def set_start_volume(self, volume: int) -> None:
+    async def set_start_volume(self, volume: int) -> int:
         """Стартовая громкость сеанса: всем колонкам текущей зоны.
 
         Закрепляется ещё раз после подключения колонок в первом play().
@@ -264,11 +266,35 @@ class OwnToneController:
         Raises:
             OwnToneZoneError: Колонок зоны нет в сети.
         """
-        target = self._clamp(volume)
+        zone = self.current_zone()
+        override = self._start_volumes.pop(zone) if zone else None
+        target = self._clamp(override if override is not None else volume)
         ids = await self._apply_zone()
         await self._set_outputs_volume(ids, target)
         self._pending_start_volume = target
-        logger.info(f"🔊 Стартовая громкость: {target}")
+        source = (
+            "выставлена заранее" if override is not None else "по умолчанию"
+        )
+        logger.info(f"🔊 Стартовая громкость: {target} ({source})")
+        return target
+
+    def remember_start_volume(self, zone: str, volume: int) -> int:
+        """Запоминает громкость для следующего включения зоны.
+
+        Raises:
+            OwnToneZoneError: Зона не настроена.
+        """
+        if zone not in self._zones:
+            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        target = self._clamp(volume)
+        self._start_volumes.put(zone, target)
+        logger.info(f"🔊 Зона «{zone}» включится с громкостью {target}")
+        return target
+
+    def next_start_volume(self, zone: str, default: int) -> int:
+        """Громкость, с которой зона включится в следующий раз."""
+        override = self._start_volumes.get(zone)
+        return self._clamp(override if override is not None else default)
 
     async def get_volume(self) -> int:
         """Общая громкость OwnTone, 0–100."""

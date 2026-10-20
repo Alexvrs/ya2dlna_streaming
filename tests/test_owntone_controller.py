@@ -12,7 +12,7 @@ from owntone_output.owntone_controller import (
     OwnToneError,
     OwnToneZoneError,
 )
-from owntone_output.zone_store import ZoneStore
+from owntone_output.zone_store import StartVolumeStore, ZoneStore
 
 ZONES = {
     "Обитель": ["Колонка"],
@@ -121,6 +121,7 @@ def make_controller(
         default_zone="Обитель",
         max_volume=30,
         zone_store=ZoneStore(tmp_path / "zone.txt"),
+        start_volume_store=StartVolumeStore(tmp_path / "start.json"),
         **kwargs,
     )
 
@@ -267,3 +268,24 @@ async def test_start_volume_applied_and_pinned_after_connect(fake, tmp_path):
     await ctl.play()
     await ctl._recheck_task
     assert fake.by_id("1")["volume"] == 25
+
+
+async def test_volume_set_while_stopped_becomes_one_time_start(fake, tmp_path):
+    ctl = make_controller(fake, tmp_path)
+    assert ctl.next_start_volume("Обитель", 10) == 10
+    assert ctl.remember_start_volume("Обитель", 25) == 25
+    assert ctl.next_start_volume("Обитель", 10) == 25
+    # Другая зона не затронута
+    assert ctl.next_start_volume("Спальня", 10) == 10
+
+    assert await ctl.set_start_volume(10) == 25
+    assert fake.by_id("1")["volume"] == 25
+    # Одноразово: следующее включение — снова по умолчанию
+    assert ctl.next_start_volume("Обитель", 10) == 10
+    assert await ctl.set_start_volume(10) == 10
+
+
+async def test_remember_start_volume_unknown_zone(fake, tmp_path):
+    ctl = make_controller(fake, tmp_path)
+    with pytest.raises(OwnToneZoneError):
+        ctl.remember_start_volume("Кухня", 20)
