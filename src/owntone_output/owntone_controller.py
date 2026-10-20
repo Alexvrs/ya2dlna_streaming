@@ -14,6 +14,11 @@ LOCAL_OUTPUT_TYPES = frozenset({"ALSA", "Pulseaudio", "fifo"})
 # Пауза перед повторной проверкой громкости после старта: AirPlay-колонка
 # при подключении может сообщить OwnTone свою громкость (вплоть до 100)
 VOLUME_RECHECK_DELAY = 1.5
+# Стартовую громкость закрепляем после начала игры дважды: колонка
+# сообщает свою громкость в первые секунды AirPlay-сеанса
+START_VOLUME_PIN_DELAYS = (1.5, 4.0)
+# Сколько ждать начала игры, чтобы закрепить стартовую громкость
+START_VOLUME_WAIT = 30.0
 
 
 class OwnToneError(Exception):
@@ -56,9 +61,7 @@ class OwnToneController:
         # Имя выхода OwnTone → его id (обновляется при каждом запросе)
         self._outputs: dict[str, dict[str, Any]] = {}
         self._recheck_task: asyncio.Task[None] | None = None
-        # Стартовая громкость, которую надо закрепить после подключения
-        # колонок при первом play() сеанса (колонка может навязать свою)
-        self._pending_start_volume: int | None = None
+        self._pin_task: asyncio.Task[None] | None = None
 
     # ---- HTTP ---------------------------------------------------------
 
@@ -233,19 +236,10 @@ class OwnToneController:
                 )
 
     async def _recheck_volumes_later(self, ids: list[str]) -> None:
-        """Повторно проверяет громкость после подключения колонок.
-
-        Если сеанс только начался — закрепляет стартовую громкость,
-        иначе лишь опускает до потолка.
-        """
+        """Повторно опускает до потолка громкость после подключения колонок."""
         try:
             await asyncio.sleep(VOLUME_RECHECK_DELAY)
-            start = self._pending_start_volume
-            self._pending_start_volume = None
-            if start is not None:
-                await self._set_outputs_volume(ids, start)
-            else:
-                await self._cap_output_volumes(ids)
+            await self._cap_output_volumes(ids)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -261,7 +255,8 @@ class OwnToneController:
     async def set_start_volume(self, volume: int) -> int:
         """Стартовая громкость сеанса: всем колонкам текущей зоны.
 
-        Закрепляется ещё раз после подключения колонок в первом play().
+        Закрепляется ещё раз, когда OwnTone начнёт играть: колонка
+        при подключении по AirPlay может навязать свою громкость.
 
         Raises:
             OwnToneZoneError: Колонок зоны нет в сети.
@@ -271,12 +266,40 @@ class OwnToneController:
         target = self._clamp(override if override is not None else volume)
         ids = await self._apply_zone()
         await self._set_outputs_volume(ids, target)
-        self._pending_start_volume = target
+        # play() выполняет другой процесс (DLNA-сервер), поэтому начало игры
+        # ждём здесь и закрепляем громкость после подключения колонок
+        if self._pin_task and not self._pin_task.done():
+            self._pin_task.cancel()
+        self._pin_task = asyncio.create_task(
+            self._pin_start_volume(ids, target)
+        )
         source = (
             "выставлена заранее" if override is not None else "по умолчанию"
         )
         logger.info(f"🔊 Стартовая громкость: {target} ({source})")
         return target
+
+    async def _pin_start_volume(self, ids: list[str], volume: int) -> None:
+        """Ждёт начала игры и закрепляет стартовую громкость."""
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + START_VOLUME_WAIT
+            while loop.time() < deadline:
+                player = await self._request("GET", "/player")
+                if player and player.get("state") == "play":
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return
+            started = loop.time()
+            for delay in START_VOLUME_PIN_DELAYS:
+                await asyncio.sleep(max(0.0, started + delay - loop.time()))
+                await self._set_outputs_volume(ids, volume)
+            logger.info(f"🔊 Стартовая громкость {volume} закреплена")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось закрепить стартовую громкость: {e}")
 
     def remember_start_volume(self, zone: str, volume: int) -> int:
         """Запоминает громкость для следующего включения зоны.
