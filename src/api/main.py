@@ -45,6 +45,9 @@ def main():
         app,
         host=settings.local_server_host,
         port=settings.local_server_port_api,
+        # Node-RED опрашивает /status каждые 10 с по одному соединению:
+        # при штатных 5 с запрос попадал на закрытие («socket hang up»)
+        timeout_keep_alive=75,
     )
 
 
