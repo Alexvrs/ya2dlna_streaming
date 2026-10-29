@@ -5,12 +5,12 @@ from logging import getLogger
 from typing import Any, Awaitable, Callable, Sequence
 
 import aiohttp
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from fastapi.responses import StreamingResponse
-from yarl import URL
 
 from core.audio_output import AudioOutput
 from core.config.settings import settings
+from core.http_redirects import resolve_redirects
 from ruark_audio_system.constants import DEFAULT_STREAM_TITLE
 
 from .constants import (
@@ -45,35 +45,6 @@ def _insert_start_position(
         return result
     result[input_index:input_index] = ["-ss", f"{start_position:.1f}"]
     return result
-
-
-REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-
-
-async def resolve_redirects(
-    url: str, max_hops: int = 5, timeout: float = 5.0
-) -> str:
-    """Проходит HTTP-перенаправления и возвращает конечный адрес.
-
-    Яндекс отдаёт ссылку на трек через 308 Permanent Redirect, который
-    FFmpeg 4.x (Debian 11 / Raspberry Pi OS bullseye) не понимает
-    и читает мусор («Invalid data found»). Конечный адрес FFmpeg
-    открывает любой версии. При любой ошибке возвращается исходный URL.
-    """
-    current = url
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
-    try:
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            for _ in range(max_hops):
-                async with session.get(current, allow_redirects=False) as resp:
-                    location = resp.headers.get("Location")
-                    if resp.status not in REDIRECT_STATUSES or not location:
-                        return current
-                    current = str(resp.url.join(URL(location)))
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        logger.warning(f"⚠️ Не удалось пройти перенаправления: {e!r}")
-        return url
-    return current
 
 
 class StreamHandler:
@@ -197,6 +168,7 @@ class StreamHandler:
         radio: bool = False,
         start_position: float = 0.0,
         codec: str = "mp3",
+        resolved: bool = False,
     ) -> None:
         """Готовит источник и запускает потоковую передачу через FFmpeg.
 
@@ -205,6 +177,7 @@ class StreamHandler:
             radio (bool): Режим радио.
             start_position (float): Позиция старта трека в секундах.
             codec (str): Кодек трека: mp3 или flac (lossless).
+            resolved (bool): Перенаправления уже пройдены отправителем.
         """
         # Очищаем папку от старых MP3 файлов перед запуском нового стрима
         if not radio and settings.stream_is_local_file:
@@ -217,11 +190,17 @@ class StreamHandler:
             self._stream_codec = "aac"
             params = self._get_ffmpeg_params(codec="aac")
         else:
-            yandex_url = (
-                await self._download_and_get_local_mp3_path(yandex_url)
-                if settings.stream_is_local_file
-                else await resolve_redirects(yandex_url)
-            )
+            if settings.stream_is_local_file:
+                yandex_url = await self._download_and_get_local_mp3_path(
+                    yandex_url
+                )
+            elif not resolved:
+                redirects_started = time.monotonic()
+                yandex_url = await resolve_redirects(yandex_url)
+                logger.info(
+                    f"⏱ Перенаправления пройдены за "
+                    f"{time.monotonic() - redirects_started:.2f}с"
+                )
             self._stream_codec = codec if codec == "flac" else "mp3"
             params = _insert_start_position(
                 self._get_ffmpeg_params(
@@ -260,15 +239,33 @@ class StreamHandler:
         else:
             logger.debug(message)
 
-    async def stream_audio(self, radio: bool = False) -> StreamingResponse:
+    async def stream_audio(
+        self, radio: bool = False, user_agent: str = ""
+    ) -> Response:
         """Отдаёт потоковый аудио-ответ клиенту.
 
         Реализована защита от залипания: если FFmpeg завершился
         или не даёт данных — поток закрывается.
+
+        Args:
+            radio (bool): Режим радио.
+            user_agent (str): User-Agent клиента. Проба сканера OwnTone
+                (Lavf/…) получает пустой ответ и не трогает pipe.
         """
         proc = self._ffmpeg.process
         if not proc or proc.stdout is None:
             raise HTTPException(status_code=404, detail="Поток не запущен")
+        if settings.output_backend == "owntone" and user_agent.startswith(
+            "Lavf/"
+        ):
+            # Pipe FFmpeg читает один клиент. Сканер OwnTone пробует
+            # адрес перед воспроизведением и съедал 80–180 КБ (колонки
+            # стартовали на 3–7 с впереди станции), а в конце трека —
+            # весь остаток (воспроизведение получало EOF, HTTP 500,
+            # тишина до страховки). Без пробы OwnTone пишет «assuming
+            # MP3 encoding» и открывает поток как обычно
+            logger.info("🙈 Проба сканера OwnTone — пустой ответ")
+            return Response(content=b"", media_type=self.stream_media_type)
         stdout = proc.stdout
 
         # Новый клиент вытесняет предыдущего: единственный читатель pipe
@@ -423,8 +420,14 @@ class StreamHandler:
         codec: str = "mp3",
         album: str = "",
         cover: str = "",
+        resolved: bool = False,
+        tid: str = "",
     ) -> None:
-        """Запускает потоковую трансляцию и передает её на Ruark."""
+        """Запускает потоковую трансляцию и передает её на Ruark.
+
+        tid — номер перехода из менеджера: по нему строки журналов
+        двух процессов склеиваются (time.monotonic у них общий).
+        """
         self._now_playing = (title or DEFAULT_STREAM_TITLE, artist)
         self._now_playing_extra = (album, cover)
         logger.info(
@@ -438,7 +441,7 @@ class StreamHandler:
             play_started = time.monotonic()
             # Запускаем потоковую передачу (быстро, без ожидания)
             await self.start_ffmpeg_stream(
-                yandex_url, radio, start_position, codec
+                yandex_url, radio, start_position, codec, resolved
             )
             ffmpeg_seconds = time.monotonic() - play_started
 
@@ -449,9 +452,10 @@ class StreamHandler:
             await self._reattach_ruark(radio)
 
             logger.info(
-                f"⏱ Запуск потока: FFmpeg {ffmpeg_seconds:.2f}с, "
-                f"привязка Ruark "
-                f"{time.monotonic() - reattach_started:.2f}с"
+                f"⏱ [{tid}] Запуск потока: FFmpeg {ffmpeg_seconds:.2f}с, "
+                f"привязка вывода "
+                f"{time.monotonic() - reattach_started:.2f}с "
+                f"(t={time.monotonic():.3f})"
             )
             logger.info("✅ Переключение трека завершено быстро!")
 

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from logging import getLogger
 
 from fastapi import APIRouter, Request, Response
@@ -31,6 +32,8 @@ async def _handle_stream_task(
     codec: str = "mp3",
     album: str = "",
     cover: str = "",
+    resolved: bool = False,
+    tid: str = "",
 ):
     """Обработчик задачи потока с логированием ошибок."""
     try:
@@ -43,6 +46,8 @@ async def _handle_stream_task(
             codec,
             album=album,
             cover=cover,
+            resolved=resolved,
+            tid=tid,
         )
         logger.info(f"✅ Задача потока {task_id} завершена успешно")
     except Exception as e:
@@ -63,16 +68,19 @@ async def set_stream(
     codec: str = "mp3",
     album: str = "",
     cover: str = "",
+    resolved: bool = False,
+    tid: str = "",
 ):
     """Принимает URL трека и запускает потоковую передачу на Ruark.
 
     start_position — позиция старта в секундах для ресинка (повтор,
     перемотка, продолжение после паузы); title и artist показываются
-    на дисплее Ruark.
+    на дисплее Ruark. resolved — ссылка уже конечная (без 308),
+    tid — номер перехода для склейки журналов.
     """
     logger.info(
-        f"📥 Запуск нового потока с {yandex_url} "
-        f"(позиция: {start_position:.1f}s)"
+        f"📥 [{tid}] Запуск нового потока с {yandex_url} "
+        f"(позиция: {start_position:.1f}s, t={time.monotonic():.3f})"
     )
 
     # Генерируем уникальный ID для задачи
@@ -98,6 +106,8 @@ async def set_stream(
             codec,
             album,
             cover,
+            resolved,
+            tid,
         )
     )
     _active_tasks[task_id] = task
@@ -113,7 +123,9 @@ async def set_stream(
 async def serve_stream(request: Request, radio: bool = False):
     """Раздает потоковый аудиофайл через HTTP."""
     await ruark_r5_request_logger(request)
-    return await _get_stream_handler(request).stream_audio(radio)
+    return await _get_stream_handler(request).stream_audio(
+        radio, user_agent=request.headers.get("user-agent", "")
+    )
 
 
 @router.head("/live_stream.mp3")

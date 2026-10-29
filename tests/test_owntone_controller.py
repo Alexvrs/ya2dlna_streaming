@@ -283,7 +283,7 @@ async def test_start_volume_applied_and_pinned_after_connect(fake, tmp_path):
     assert fake.by_id("1")["volume"] == 25
 
 
-async def test_volume_set_while_stopped_becomes_one_time_start(fake, tmp_path):
+async def test_volume_set_while_stopped_becomes_start(fake, tmp_path):
     ctl = make_controller(fake, tmp_path)
     assert ctl.next_start_volume("Обитель", 10) == 10
     assert ctl.remember_start_volume("Обитель", 25) == 25
@@ -293,9 +293,35 @@ async def test_volume_set_while_stopped_becomes_one_time_start(fake, tmp_path):
 
     assert await ctl.set_start_volume(10) == 25
     assert fake.by_id("1")["volume"] == 25
-    # Одноразово: следующее включение — снова по умолчанию
-    assert ctl.next_start_volume("Обитель", 10) == 10
-    assert await ctl.set_start_volume(10) == 10
+    # Запоминается насовсем, а не на одно включение
+    assert ctl.next_start_volume("Обитель", 10) == 25
+    assert await ctl.set_start_volume(10) == 25
+
+
+async def test_last_volume_survives_restart_of_stream(fake, tmp_path):
+    """Громкость при остановке — стартовая при следующем включении."""
+    ctl = make_controller(fake, tmp_path)
+    await ctl.set_start_volume(10)
+    ctl.remember_session_volume(22)
+
+    again = make_controller(fake, tmp_path)  # новый процесс после рестарта
+    assert again.next_start_volume("Обитель", 10) == 22
+    assert await again.set_start_volume(10) == 22
+
+
+async def test_zone_volume_change_is_remembered(fake, tmp_path):
+    ctl = make_controller(fake, tmp_path)
+    await ctl.set_zone_volume("Обитель", 18)
+    assert ctl.next_start_volume("Обитель", 10) == 18
+
+
+async def test_silence_is_not_remembered(fake, tmp_path):
+    """Тишина и приглушение на речь Алисы не становятся стартовыми."""
+    ctl = make_controller(fake, tmp_path)
+    await ctl.set_zone_volume("Обитель", 18)
+    ctl.remember_session_volume(2)
+    await ctl.set_zone_volume("Обитель", 0)
+    assert ctl.next_start_volume("Обитель", 10) == 18
 
 
 async def test_remember_start_volume_unknown_zone(fake, tmp_path):

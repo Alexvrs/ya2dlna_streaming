@@ -5,13 +5,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from main_stream_service import main_stream_manager as manager_module
 from main_stream_service.main_stream_manager import (
     MainStreamManager,
     _CycleContext,
 )
-from main_stream_service.yandex_music_api import TrackSource, YandexMusicAPI
+from main_stream_service.yandex_music_api import (
+    TrackInfo,
+    TrackSource,
+    YandexMusicAPI,
+)
 from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
 from yandex_station.constants import (
+    OUTPUT_AUDIBLE_DELAY,
     RUARK_IDLE_VOLUME,
     SILENT_RESEND_LIMIT,
     STREAM_POLL_INTERVAL,
@@ -22,6 +28,22 @@ from yandex_station.station_controls import YandexStationControls
 
 # Настоящий sleep сохраняется до подмены в фикстуре fast_sleep
 REAL_SLEEP = asyncio.sleep
+
+# Префикс конечной ссылки после «прохода» перенаправлений в тестах
+CDN = "http://cdn/"
+
+
+@pytest.fixture(autouse=True)
+def no_redirect_lookup(monkeypatch):
+    """Фиктивные адреса тестов не ходят в сеть за перенаправлениями.
+
+    Ссылка остаётся прежней: тесты сверяют отправленный адрес.
+    """
+
+    async def identity(url, *args, **kwargs):
+        return url
+
+    monkeypatch.setattr(manager_module, "try_resolve_redirects", identity)
 
 
 @pytest.fixture
@@ -88,6 +110,7 @@ def make_ruark(is_playing=True, volume=20):
 
 def make_manager(station_controls, ruark, track_url="http://track/url"):
     music_api = AsyncMock(spec=YandexMusicAPI)
+    music_api.get_track_meta.return_value = TrackInfo()
     music_api.get_file_info.return_value = track_url
     music_api.get_track_source.return_value = (
         TrackSource(url=track_url, codec="mp3") if track_url else None
@@ -520,6 +543,8 @@ async def test_playing_ruark_resets_silent_resend_streak(
         return next(states)
 
     ruark.is_playing.side_effect = next_state
+    # Станция уже приглушена: is_playing опрашивает только страховка
+    station.get_volume.return_value = 0.0
     manager = make_manager(station, ruark)
 
     await drive_streaming(
@@ -770,3 +795,126 @@ async def test_stop_survives_unreachable_ruark():
     # Главные шаги дошли до конца, несмотря на мёртвый Ruark
     station.unmute.assert_called()
     station.stop_ws_client.assert_called()
+
+
+async def test_long_iteration_is_not_a_progress_jump(fast_sleep):
+    """Снапшот привязан к моменту чтения станции, а не к концу итерации.
+
+    Старт потока и затухание станции занимают ~5 с одной итерации;
+    прогресс, прочитанный в её начале, с отметкой времени из её конца
+    выглядел как перемотка и вызывал лишний ресинк (25.10.2026).
+    """
+    first = make_track(progress=10.0)
+    first.captured_at = time.monotonic() - 6.0  # прочитан 6 с назад
+    tracks = [first] + [make_track(progress=16.0)] * 3
+    station = make_station_controls(tracks=tracks)
+    manager = make_manager(station, make_ruark())
+    send = manager._send_track_to_stream_server
+
+    await drive_streaming(manager, until=lambda: False, timeout=0.1)
+
+    assert send.call_count == 1
+
+
+def make_ctx(**kwargs) -> _CycleContext:
+    defaults = dict(last_track=make_track(), last_alice_state="IDLE")
+    defaults.update(kwargs)
+    return _CycleContext(**defaults)
+
+
+async def test_station_keeps_playing_until_output_plays(fast_sleep):
+    """Колонки ещё молчат после отправки потока — станция не гаснет."""
+    station = make_station_controls(make_track())
+    manager = make_manager(station, make_ruark(is_playing=False))
+    ctx = make_ctx(last_stream_sent_at=time.monotonic())
+
+    await manager._fade_alice_if_playing(make_track(), ctx)
+
+    station.fade_out_alice_volume.assert_not_called()
+
+
+async def test_station_fades_after_output_audible_delay(monkeypatch):
+    """После старта потока — ждём задержку вывода, затем гасим станцию."""
+    sleeps = []
+
+    async def fake_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    station = make_station_controls(make_track())
+    manager = make_manager(station, make_ruark(is_playing=True))
+    ctx = make_ctx(last_stream_sent_at=time.monotonic())
+
+    await manager._fade_alice_if_playing(make_track(), ctx)
+
+    assert OUTPUT_AUDIBLE_DELAY in sleeps
+    station.fade_out_alice_volume.assert_awaited_once()
+
+
+async def test_station_fades_at_once_when_stream_is_old(monkeypatch):
+    """Поток давно играет (громкость станции подняли) — без ожидания."""
+    sleeps = []
+
+    async def fake_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    station = make_station_controls(make_track())
+    manager = make_manager(station, make_ruark(is_playing=True))
+    ctx = make_ctx(last_stream_sent_at=time.monotonic() - 60.0)
+
+    await manager._fade_alice_if_playing(make_track(), ctx)
+
+    assert sleeps == []
+    station.fade_out_alice_volume.assert_awaited_once()
+
+
+async def test_prefetch_warms_meta_and_hot_switch_skips_music_api(
+    fast_sleep,
+):
+    """Предзагрузка греет и ссылку, и метаданные: переход без API."""
+    first = make_track(id="42", next_id="43")
+    second = make_track(id="43", prev_id="42", progress=0.5)
+    station = make_station_controls(tracks=[first] * 8 + [second])
+    manager = make_manager(station, make_ruark())
+    set_source_by_id(manager)
+    api = manager._yandex_music_api
+    send = manager._send_track_to_stream_server
+
+    await drive_streaming(
+        manager,
+        until=lambda: any(
+            call.args[0] == "http://track/43" for call in send.call_args_list
+        ),
+    )
+
+    meta_ids = [call.args[0] for call in api.get_track_meta.call_args_list]
+    assert meta_ids.count("43") == 1
+    assert len(source_calls_for(manager, "43")) == 1
+    switch = next(
+        call
+        for call in send.call_args_list
+        if call.args[0] == "http://track/43"
+    )
+    assert switch.kwargs["resolved"] is True
+    assert switch.kwargs["tid"].startswith("43#")
+
+
+async def test_failed_redirect_lookup_leaves_link_to_stream_server(
+    monkeypatch,
+):
+    """Нет сети к CDN — ссылка не помечена конечной, её пройдёт сервер."""
+
+    async def offline(url, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(manager_module, "try_resolve_redirects", offline)
+    source = TrackSource(url="http://track/1", codec="mp3")
+    assert await MainStreamManager._expand_source(source) == source
+
+    async def to_cdn(url, *args, **kwargs):
+        return CDN + url.rsplit("/", 1)[-1]
+
+    monkeypatch.setattr(manager_module, "try_resolve_redirects", to_cdn)
+    expanded = await MainStreamManager._expand_source(source)
+    assert expanded == TrackSource(url=CDN + "1", codec="mp3", resolved=True)

@@ -12,6 +12,7 @@ import aiohttp
 from injector import inject
 
 from core.authorization.yandex_tokens import get_device_token
+from core.config.settings import settings
 from yandex_station.constants import SOCKET_RECONNECT_DELAY
 from yandex_station.exceptions import (
     ClientNotRunningError,
@@ -21,6 +22,27 @@ from yandex_station.mdns_device_finder import DeviceFinder, StationDevice
 from yandex_station.station_store import StationDeviceStore
 
 logger = logging.getLogger(__name__)
+# Отдельный логгер сырых состояний: его легко отфильтровать в журнале
+raw_logger = logging.getLogger("yandex_station.raw")
+
+
+def raw_state_line(data: Any, now: float) -> str | None:
+    """Строка сырого журнала: время прихода и всё о плеере и Алисе.
+
+    Из сообщения берутся только состояние (playerState целиком,
+    aliceState, playing, громкость) — без тяжёлого extra.appState.
+    """
+    state = data.get("state") if isinstance(data, dict) else None
+    if not isinstance(state, dict):
+        return None
+    record = {
+        "t": round(now, 3),
+        "alice": state.get("aliceState"),
+        "playing": state.get("playing"),
+        "volume": state.get("volume"),
+        "player": state.get("playerState"),
+    }
+    return "RAW " + json.dumps(record, ensure_ascii=False, default=str)
 
 
 class YandexStationClient:
@@ -397,6 +419,10 @@ class YandexStationClient:
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
+                    if settings.station_raw_log:
+                        line = raw_state_line(data, time.monotonic())
+                        if line:
+                            raw_logger.info(line)
                     self.queue.append(data)
                     self.state_updated.set()
                     logger.debug("📨 Получено сообщение от станции")

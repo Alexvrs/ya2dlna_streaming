@@ -404,3 +404,63 @@ def test_ffmpeg_params_for_flac_remux_without_reencode():
     assert params is FFMPEG_FLAC_PARAMS
     assert "copy" in params
     assert "flac" in params
+
+
+async def test_owntone_scanner_probe_does_not_consume_pipe(monkeypatch):
+    """Проба сканера OwnTone (Lavf) не забирает данные из pipe FFmpeg."""
+    monkeypatch.setattr(
+        stream_handler_module.settings, "output_backend", "owntone"
+    )
+    handler, _ = make_handler()
+    set_params(handler, ["sh", "-c", "printf START; sleep 5"])
+    await handler.start_ffmpeg_stream("http://example/one")
+
+    probe = await handler.stream_audio(user_agent="Lavf/58.45.100")
+    assert probe.body == b""
+
+    player = (
+        await handler.stream_audio(user_agent="AirPlay/999.0.0")
+    ).body_iterator
+    assert (await read_chunk(player)).startswith(b"START")
+
+    await player.aclose()
+    await handler.stop_ffmpeg()
+
+
+async def test_ruark_backend_serves_lavf_client(monkeypatch):
+    """В режиме Ruark клиент Lavf получает поток как раньше."""
+    monkeypatch.setattr(
+        stream_handler_module.settings, "output_backend", "ruark"
+    )
+    handler, _ = make_handler()
+    set_params(handler, ["sh", "-c", "printf START; sleep 5"])
+    await handler.start_ffmpeg_stream("http://example/one")
+
+    client = (
+        await handler.stream_audio(user_agent="Lavf/58.45.100")
+    ).body_iterator
+    assert (await read_chunk(client)).startswith(b"START")
+
+    await client.aclose()
+    await handler.stop_ffmpeg()
+
+
+async def test_resolved_link_skips_redirect_lookup(monkeypatch):
+    """Ссылку, развёрнутую менеджером, сервер не разворачивает снова."""
+    lookups: list[str] = []
+
+    async def counting(url, *args, **kwargs):
+        lookups.append(url)
+        return url + "?cdn"
+
+    monkeypatch.setattr(stream_handler_module, "resolve_redirects", counting)
+    handler, _ = make_handler()
+    handler._ffmpeg.start = AsyncMock()
+
+    await handler.start_ffmpeg_stream("http://cdn/track", resolved=True)
+    assert lookups == []
+    assert handler._ffmpeg.start.call_args.args[0] == "http://cdn/track"
+
+    await handler.start_ffmpeg_stream("http://yandex/track")
+    assert lookups == ["http://yandex/track"]
+    assert handler._ffmpeg.start.call_args.args[0] == "http://yandex/track?cdn"

@@ -1,14 +1,20 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from main_stream_service.main_stream_manager import MainStreamManager
-from main_stream_service.yandex_music_api import YandexMusicAPI
+from main_stream_service.yandex_music_api import TrackInfo, YandexMusicAPI
 from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
 from yandex_station.models import Track
 from yandex_station.station_controls import YandexStationControls
 
 
 def make(
-    meta=("Live in Moscow", "avatars.yandex.net/get-music-content/1/a/%%")
+    meta=TrackInfo(
+        title="Metal Heart",
+        artist="Dirkschneider",
+        album="Live in Moscow",
+        cover="avatars.yandex.net/get-music-content/1/a/%%",
+    )
 ):
     api = AsyncMock(spec=YandexMusicAPI)
     api.get_track_meta.return_value = meta
@@ -68,3 +74,48 @@ async def test_api_failure_does_not_break_stream():
     manager, api = make()
     api.get_track_meta.side_effect = RuntimeError("сеть")
     assert await manager._track_meta(track()) == {"album": "", "cover": ""}
+
+
+def running(manager, current):
+    manager._stream_state_running = True
+    manager._last_track = current
+    return manager
+
+
+async def test_next_track_described_from_music_api():
+    manager, api = make()
+    current = track()
+    current.next_id = "777"
+    info = await running(manager, current).next_track_info()
+    assert info == {
+        "id": "777",
+        "title": "Metal Heart",
+        "artist": "Dirkschneider",
+        "album": "Live in Moscow",
+        "cover": "https://avatars.yandex.net/get-music-content/1/a/400x400",
+    }
+    await manager.next_track_info()
+    api.get_track_meta.assert_awaited_once_with("777")
+
+
+async def test_next_track_none_when_unknown_or_stopped():
+    manager, api = make()
+    assert await manager.next_track_info() is None
+    assert await running(manager, track()).next_track_info() is None
+    radio = track(type_="FmRadio")
+    radio.next_id = "777"
+    assert await running(manager, radio).next_track_info() is None
+    api.get_track_meta.assert_not_called()
+
+
+async def test_next_track_none_on_api_timeout():
+    manager, api = make()
+
+    async def slow(_):
+        await asyncio.sleep(1)
+
+    api.get_track_meta.side_effect = slow
+    current = track()
+    current.next_id = "777"
+    running(manager, current)
+    assert await manager.next_track_info(timeout=0.01) is None

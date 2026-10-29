@@ -9,11 +9,18 @@ from injector import inject
 
 from core.audio_output import AudioOutput
 from core.config.settings import settings
-from main_stream_service.yandex_music_api import TrackSource, YandexMusicAPI
+from core.http_redirects import try_resolve_redirects
+from main_stream_service.yandex_music_api import (
+    TrackInfo,
+    TrackSource,
+    YandexMusicAPI,
+)
 from ruark_audio_system.exceptions import RuarkDeviceNotFoundError
 from ruark_audio_system.volume_store import RuarkVolumeStore
 from yandex_station.constants import (
     ALICE_ACTIVE_STATES,
+    OUTPUT_AUDIBLE_DELAY,
+    OUTPUT_START_TIMEOUT,
     PROGRESS_JUMP_THRESHOLD,
     RUARK_IDLE_VOLUME,
     RUARK_MIN_START_VOLUME,
@@ -46,6 +53,20 @@ class TrackMeta(TypedDict):
 
     album: str
     cover: str
+
+
+class NextTrack(TypedDict):
+    """Следующий трек очереди станции для /status."""
+
+    id: str
+    title: str
+    artist: str
+    album: str
+    cover: str
+
+
+# Сколько /status ждёт API Музыки за описанием следующего трека
+NEXT_TRACK_INFO_TIMEOUT = 3.0
 
 
 @dataclass
@@ -108,7 +129,11 @@ class MainStreamManager:
         self._shutdown_task: asyncio.Task[None] | None = None
         self._source_cache: dict[str, tuple[TrackSource, float]] = {}
         self._prefetch_tasks: dict[str, asyncio.Task[None]] = {}
-        self._meta_cache: dict[str, tuple[str, str | None]] = {}
+        self._meta_cache: dict[str, TrackInfo] = {}
+        # Номер перехода для склейки журналов API и сервера стрима
+        self._transition_seq = 0
+        # Последний трек со станции — источник «следующего» для /status
+        self._last_track: Track | None = None
 
     @property
     def is_running(self) -> bool:
@@ -164,6 +189,7 @@ class MainStreamManager:
         """
         logger.info("🛑 Остановка стриминга...")
         self._stream_state_running = False
+        self._last_track = None
         await self._remember_ruark_volume()
         await self._safe_stop_step(self._ruark_controls.stop)
         await self._safe_stop_step(self._stop_stream_on_stream_server)
@@ -248,8 +274,9 @@ class MainStreamManager:
                 await self._unmute_before_track_end(track, alice_state)
 
                 self._log_current_track(track, alice_state, ctx)
+                self._last_track = track
                 ctx.last_track_progress = track.progress
-                ctx.last_progress_at = time.monotonic()
+                ctx.last_progress_at = track.captured_at
                 ctx.last_track_playing = track.playing
                 ctx.last_alice_state = alice_state
                 # Новое сообщение станции будит цикл сразу,
@@ -301,7 +328,7 @@ class MainStreamManager:
         self._schedule_prefetch(track)
         await self._restore_ruark_after_speech(track, ctx)
         await self._resume_track_if_silent(track, ctx)
-        await self._fade_alice_if_playing(track)
+        await self._fade_alice_if_playing(track, ctx)
         ctx.volume_set_count = 0
         return track
 
@@ -539,8 +566,22 @@ class MainStreamManager:
             quality=settings.stream_quality,
         )
         if source:
+            source = await self._expand_source(source)
             self._store_source(track_id, source)
         return source
+
+    @staticmethod
+    async def _expand_source(source: TrackSource) -> TrackSource:
+        """Проходит 308-перенаправления Яндекса заранее.
+
+        Тогда сервер стрима на смене трека сразу запускает FFmpeg,
+        без лишнего запроса к CDN. При ошибке сети ссылка остаётся
+        прежней, и перенаправления пройдёт сервер стрима.
+        """
+        final = await try_resolve_redirects(source.url)
+        if final is None:
+            return source
+        return TrackSource(url=final, codec=source.codec, resolved=True)
 
     def _schedule_prefetch(self, track: Track) -> None:
         """Фоново предзагружает ссылки соседних треков очереди.
@@ -566,6 +607,8 @@ class MainStreamManager:
         """Резолвит и кеширует ссылку трека в фоновой задаче."""
         try:
             source = await self._resolve_track_source(track_id)
+            # Альбом и обложка тоже заранее: на смене трека — из кеша
+            await self._track_info(track_id)
             if source:
                 logger.info(
                     f"📦 Предзагружена ссылка трека {track_id} "
@@ -618,14 +661,25 @@ class MainStreamManager:
             return
 
         switch_started = time.monotonic()
+        self._transition_seq += 1
+        tid = f"{track.id}#{self._transition_seq}"
         codec = "mp3"
+        resolved = False
+        hot = self._get_cached_source(track.id) is not None
         if track.type == "FmRadio":
             ctx.track_url = await self._station_controls.get_radio_url()
             logger.info(f"🎵 URL радиостанции: {ctx.track_url}")
+            meta = await self._track_meta(track)
         else:
-            source = await self._resolve_track_source(track.id)
+            # Ссылка и метаданные параллельно: при холодном кеше
+            # переход ждёт самый долгий запрос, а не их сумму
+            source, meta = await asyncio.gather(
+                self._resolve_track_source(track.id),
+                self._track_meta(track),
+            )
             ctx.track_url = source.url if source else None
             codec = source.codec if source else "mp3"
+            resolved = source.resolved if source else False
         resolve_seconds = time.monotonic() - switch_started
 
         if ctx.track_url:
@@ -648,12 +702,17 @@ class MainStreamManager:
                 title=track.title,
                 artist=track.artist,
                 codec=codec,
-                **(await self._track_meta(track)),
+                resolved=resolved,
+                tid=tid,
+                **meta,
             )
             logger.info(
-                f"⏱ Переключение на {track.id}: ссылка "
-                f"{resolve_seconds:.2f}с, отправка "
-                f"{time.monotonic() - send_started:.2f}с"
+                f"⏱ [{tid}] Переключение: от состояния станции "
+                f"{switch_started - track.captured_at:.2f}с, ссылка и "
+                f"метаданные {resolve_seconds:.2f}с "
+                f"({'кеш' if hot else 'запрос'}), отправка "
+                f"{time.monotonic() - send_started:.2f}с "
+                f"(t={time.monotonic():.3f})"
             )
             ctx.last_track = track
         else:
@@ -723,20 +782,50 @@ class MainStreamManager:
         await self._ruark_controls.set_volume(self._ruark_volume)
         ctx.restored_volume = self._ruark_volume
 
-    async def _fade_alice_if_playing(self, track: Track) -> None:
-        """Плавно глушит Алису, пока трек или радио играют на Ruark."""
+    async def _fade_alice_if_playing(
+        self, track: Track, ctx: "_CycleContext"
+    ) -> None:
+        """Плавно глушит Алису, пока трек или радио играют на Ruark.
+
+        Сразу после отправки потока колонки ещё молчат: станция гаснет
+        только когда вывод заиграл и прошла его задержка до звука —
+        иначе между станцией и колонками слышна пауза.
+        """
         current_volume = await self._station_controls.get_volume()
 
-        if (
+        if not (
             (
-                current_volume is not None
-                and current_volume > 0
-                and track.duration - track.progress > 10
-                and track.type != "FmRadio"
+                (
+                    current_volume is not None
+                    and current_volume > 0
+                    and track.duration - track.progress > 10
+                    and track.type != "FmRadio"
+                )
+                or (track.type == "FmRadio" and track.playing)
             )
-            or (track.type == "FmRadio" and track.playing)
-        ) and track.playing:
-            await self._station_controls.fade_out_alice_volume()
+            and track.playing
+        ):
+            return
+
+        since_sent = time.monotonic() - ctx.last_stream_sent_at
+        if since_sent < OUTPUT_START_TIMEOUT + OUTPUT_AUDIBLE_DELAY:
+            if not await self._wait_output_playing(OUTPUT_START_TIMEOUT):
+                logger.info(
+                    "⏳ Колонки ещё не играют — станция пока не гаснет"
+                )
+                return
+            await asyncio.sleep(OUTPUT_AUDIBLE_DELAY)
+
+        await self._station_controls.fade_out_alice_volume()
+
+    async def _wait_output_playing(self, timeout: float) -> bool:
+        """Ждёт, пока вывод (OwnTone/Ruark) начнёт играть."""
+        attempts = max(1, int(timeout / 0.2))
+        for _ in range(attempts):
+            if await self._ruark_controls.is_playing():
+                return True
+            await asyncio.sleep(0.2)
+        return False
 
     async def _unmute_before_track_end(
         self, track: Track, alice_state: str | None
@@ -824,6 +913,12 @@ class MainStreamManager:
             )
             return
         self._volume_store.save(self._ruark_volume)
+        # OwnTone: громкость зоны — стартовая при следующем включении
+        remember = getattr(
+            self._ruark_controls, "remember_session_volume", None
+        )
+        if remember is not None:
+            remember(self._ruark_volume)
 
     async def _apply_start_volume(self, volume: int) -> None:
         """Ставит заданную стартовую громкость вместо прошлого сеанса."""
@@ -879,6 +974,31 @@ class MainStreamManager:
                 f"поднята до {RUARK_MIN_START_VOLUME}"
             )
 
+    async def _track_info(self, track_id: str) -> TrackInfo:
+        """Описание трека из API Музыки, кешируется по id.
+
+        Ошибка API кешируется пустым описанием: стрим и /status
+        не повторяют запрос каждую итерацию.
+        """
+        cached = self._meta_cache.get(track_id)
+        if cached is None:
+            try:
+                cached = await self._yandex_music_api.get_track_meta(track_id)
+            except Exception as e:
+                logger.debug(f"Метаданные трека {track_id}: {e}")
+                cached = TrackInfo()
+            if len(self._meta_cache) >= TRACK_SOURCE_CACHE_SIZE:
+                self._meta_cache.pop(next(iter(self._meta_cache)))
+            self._meta_cache[track_id] = cached
+        return cached
+
+    @staticmethod
+    def _cover_url(cover: str | None) -> str:
+        """Ссылка на обложку 400×400 из шаблона с %%."""
+        if not cover:
+            return ""
+        return "https://" + cover.split("://")[-1].replace("%%", "400x400")
+
     async def _track_meta(self, track: Track) -> TrackMeta:
         """Альбом и ссылка на обложку трека для дисплеев колонок.
 
@@ -887,25 +1007,39 @@ class MainStreamManager:
         """
         album, cover = "", track.cover
         if track.type != "FmRadio" and track.id and track.id != "0":
-            cached = self._meta_cache.get(track.id)
-            if cached is None:
-                try:
-                    cached = await self._yandex_music_api.get_track_meta(
-                        track.id
-                    )
-                except Exception as e:
-                    logger.debug(f"Метаданные трека {track.id}: {e}")
-                    cached = ("", None)
-                if len(self._meta_cache) >= TRACK_SOURCE_CACHE_SIZE:
-                    self._meta_cache.pop(next(iter(self._meta_cache)))
-                self._meta_cache[track.id] = cached
-            album = cached[0]
-            cover = cover or cached[1]
-        if cover:
-            cover = "https://" + cover.split("://")[-1].replace(
-                "%%", "400x400"
+            info = await self._track_info(track.id)
+            album = info.album
+            cover = cover or info.cover
+        return {"album": album, "cover": self._cover_url(cover)}
+
+    async def next_track_info(
+        self, timeout: float = NEXT_TRACK_INFO_TIMEOUT
+    ) -> NextTrack | None:
+        """Следующий трек очереди станции (entityInfo.next).
+
+        None — стрим не идёт, станция не сообщила следующий трек
+        (радио, конец очереди) или API Музыки не ответил за timeout.
+        """
+        track = self._last_track
+        if not self._stream_state_running or track is None:
+            return None
+        next_id = track.next_id
+        if not next_id or track.type == "FmRadio":
+            return None
+        try:
+            info = await asyncio.wait_for(
+                self._track_info(next_id), timeout=timeout
             )
-        return {"album": album, "cover": cover or ""}
+        except asyncio.TimeoutError:
+            logger.debug(f"Описание следующего трека {next_id}: таймаут")
+            return None
+        return {
+            "id": next_id,
+            "title": info.title,
+            "artist": info.artist,
+            "album": info.album,
+            "cover": self._cover_url(info.cover),
+        }
 
     async def _send_track_to_stream_server(
         self,
@@ -917,6 +1051,8 @@ class MainStreamManager:
         codec: str = "mp3",
         album: str = "",
         cover: str = "",
+        resolved: bool = False,
+        tid: str = "",
     ):
         """Отправляет ссылку на трек на стрим сервер.
 
@@ -929,6 +1065,8 @@ class MainStreamManager:
             codec (str): Кодек источника: mp3 или flac.
             album (str): Альбом для дисплеев колонок.
             cover (str): Ссылка на обложку.
+            resolved (bool): Ссылка уже конечная, без перенаправлений.
+            tid (str): Номер перехода для склейки журналов.
         """
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -946,6 +1084,8 @@ class MainStreamManager:
                         "codec": codec,
                         "album": album,
                         "cover": cover,
+                        "resolved": str(resolved).lower(),
+                        "tid": tid,
                     },
                 ) as resp:
                     response = await resp.json()

@@ -1,10 +1,12 @@
 import asyncio
+import time
 from logging import getLogger
 from typing import Any
 
 import aiohttp
 
 from owntone_output.zone_store import StartVolumeStore, ZoneStore
+from yandex_station.constants import RUARK_IDLE_VOLUME
 
 logger = getLogger(__name__)
 
@@ -63,6 +65,8 @@ class OwnToneController:
         # Имя выхода OwnTone → его id (обновляется при каждом запросе)
         self._outputs: dict[str, dict[str, Any]] = {}
         self._recheck_task: asyncio.Task[None] | None = None
+        # Фоновый замер «через сколько OwnTone заиграл»
+        self._timing_task: asyncio.Task[None] | None = None
         self._pin_task: asyncio.Task[None] | None = None
 
     # ---- HTTP ---------------------------------------------------------
@@ -213,7 +217,17 @@ class OwnToneController:
                 "PUT", f"/outputs/{output_id}", json={"volume": target}
             )
         logger.info(f"🔊 Громкость зоны «{zone}»: {target}")
+        self._remember_zone_volume(zone, target)
         return target
+
+    def _remember_zone_volume(self, zone: str, volume: int) -> None:
+        """Сохраняет громкость зоны для следующего включения.
+
+        Тишину не запоминаем: стрим, включившийся в тишине, выглядит
+        сломанным (и приглушение на речь Алисы — не выбор громкости).
+        """
+        if volume > RUARK_IDLE_VOLUME:
+            self._start_volumes.put(zone, volume)
 
     def _clamp(self, volume: int) -> int:
         """Ограничивает громкость диапазоном 0…max_volume."""
@@ -264,7 +278,7 @@ class OwnToneController:
             OwnToneZoneError: Колонок зоны нет в сети.
         """
         zone = self.current_zone()
-        override = self._start_volumes.pop(zone) if zone else None
+        override = self._start_volumes.get(zone) if zone else None
         target = self._clamp(override if override is not None else volume)
         ids = await self._apply_zone()
         await self._set_outputs_volume(ids, target)
@@ -275,9 +289,7 @@ class OwnToneController:
         self._pin_task = asyncio.create_task(
             self._pin_start_volume(ids, target)
         )
-        source = (
-            "выставлена заранее" if override is not None else "по умолчанию"
-        )
+        source = "последняя" if override is not None else "по умолчанию"
         logger.info(f"🔊 Стартовая громкость: {target} ({source})")
         return target
 
@@ -315,6 +327,17 @@ class OwnToneController:
         self._start_volumes.put(zone, target)
         logger.info(f"🔊 Зона «{zone}» включится с громкостью {target}")
         return target
+
+    def remember_session_volume(self, volume: int) -> None:
+        """Запоминает громкость текущей зоны при остановке стрима."""
+        zone = self.current_zone()
+        if not zone:
+            return
+        target = self._clamp(volume)
+        if target <= RUARK_IDLE_VOLUME:
+            return
+        self._start_volumes.put(zone, target)
+        logger.info(f"💾 Громкость зоны «{zone}» запомнена: {target}")
 
     def next_start_volume(self, zone: str, default: int) -> int:
         """Громкость, с которой зона включится в следующий раз."""
@@ -414,20 +437,55 @@ class OwnToneController:
         """
         if not self._stream_url:
             raise OwnToneError("Адрес потока не задан")
+        started = time.monotonic()
         ids = await self._apply_zone()
+        zone_done = time.monotonic()
         await self._cap_output_volumes(ids)
+        cap_done = time.monotonic()
         await self._request("PUT", "/queue/clear")
         added = await self._request(
             "POST",
             "/queue/items/add",
             params={"uris": self._stream_url, "playback": "start"},
         )
+        add_done = time.monotonic()
         await self._apply_metadata(added)
+        logger.info(
+            f"⏱ OwnTone play: зона {zone_done - started:.2f}с, "
+            f"потолок громкости {cap_done - zone_done:.2f}с, очередь "
+            f"{add_done - cap_done:.2f}с, метаданные "
+            f"{time.monotonic() - add_done:.2f}с"
+        )
+        if self._timing_task and not self._timing_task.done():
+            self._timing_task.cancel()
+        self._timing_task = asyncio.create_task(
+            self._log_time_to_play(add_done)
+        )
         if self._recheck_task and not self._recheck_task.done():
             self._recheck_task.cancel()
         self._recheck_task = asyncio.create_task(
             self._recheck_volumes_later(ids)
         )
+
+    async def _log_time_to_play(
+        self, since: float, timeout: float = 10.0, interval: float = 0.2
+    ) -> None:
+        """Замер: через сколько после постановки в очередь OwnTone играет."""
+        deadline = since + timeout
+        try:
+            while time.monotonic() < deadline:
+                player = await self._request("GET", "/player")
+                if isinstance(player, dict) and player.get("state") == "play":
+                    logger.info(
+                        f"⏱ OwnTone играет через "
+                        f"{time.monotonic() - since:.2f}с после очереди "
+                        f"(позиция {player.get('item_progress_ms')} мс)"
+                    )
+                    return
+                await asyncio.sleep(interval)
+            logger.info(f"⏱ OwnTone не заиграл за {timeout:.0f}с")
+        except OwnToneError as e:
+            logger.debug(f"Замер старта OwnTone прерван: {e}")
 
     async def stop(self) -> None:
         """Останавливает воспроизведение OwnTone."""

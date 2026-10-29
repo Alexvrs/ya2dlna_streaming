@@ -7,6 +7,8 @@ from injector import inject
 
 from yandex_station.constants import (
     ALICE_ACTIVE_STATES,
+    ALICE_FADE_DELAY,
+    ALICE_FADE_STEP_DELAY,
     FADE_TIME,
     TTS_REPEAT_PREFIX,
 )
@@ -259,13 +261,18 @@ class YandexStationControls:
         await self.mute()
 
     async def fade_out_alice_volume(
-        self, min_volume: float = 0.0, step: float = 0.1, delay: float = 0.3
+        self,
+        min_volume: float = 0.0,
+        step: float = 0.1,
+        delay: float = ALICE_FADE_STEP_DELAY,
+        wait: float = ALICE_FADE_DELAY,
     ):
         """Плавное уменьшение громкости Алисы в несколько шагов."""
         if self._was_muted:
             return
-        logger.info(f"🎧 Ждём {FADE_TIME}s перед fade out громкости")
-        await asyncio.sleep(FADE_TIME)
+        if wait > 0:
+            logger.info(f"🎧 Ждём {wait}s перед fade out громкости")
+            await asyncio.sleep(wait)
         start_volume = await self.get_volume()
         if start_volume is None:
             logger.warning(

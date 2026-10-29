@@ -30,6 +30,18 @@ class TrackSource:
 
     url: str
     codec: str  # "flac" | "mp3"
+    # Перенаправления уже пройдены: url — конечный адрес CDN
+    resolved: bool = False
+
+
+@dataclass
+class TrackInfo:
+    """Описание трека из API Музыки (обложка — с %% вместо размера)."""
+
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    cover: str | None = None
 
 
 class YandexMusicAPI:
@@ -40,22 +52,29 @@ class YandexMusicAPI:
     def __init__(self, client: ClientAsync):
         self._client = client
 
-    async def get_track_meta(
-        self, track_id: str | int
-    ) -> tuple[str, str | None]:
-        """Альбом и обложка трека (обложка — с %% вместо размера).
+    async def get_track_meta(self, track_id: str | int) -> TrackInfo:
+        """Название, исполнители, альбом и обложка трека.
 
         Returns:
-            tuple[str, str | None]: Название альбома и cover_uri.
+            TrackInfo: Пустые поля, если трек не найден.
         """
         tracks = await self._client.tracks([track_id])
         if not tracks:
-            return "", None
+            return TrackInfo()
         track = tracks[0]
         albums = getattr(track, "albums", None) or []
         album = str(getattr(albums[0], "title", "") or "") if albums else ""
+        artists = getattr(track, "artists", None) or []
+        artist = ", ".join(
+            str(a.name) for a in artists if getattr(a, "name", None)
+        )
         cover = getattr(track, "cover_uri", None)
-        return album, str(cover) if cover else None
+        return TrackInfo(
+            title=str(getattr(track, "title", "") or ""),
+            artist=artist,
+            album=album,
+            cover=str(cover) if cover else None,
+        )
 
     async def get_track_source(
         self,

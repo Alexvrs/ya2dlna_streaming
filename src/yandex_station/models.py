@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,3 +18,9 @@ class Track:
     prev_id: str | None = None
     # Ссылка на обложку из состояния станции (extra.coverURI), с %%
     cover: str | None = None
+    # Момент чтения состояния станции (time.monotonic): к нему привязан
+    # progress, поэтому ожидаемая позиция считается от него, а не от
+    # конца итерации цикла (долгая итерация выглядела бы как перемотка)
+    captured_at: float = field(
+        default_factory=time.monotonic, compare=False, repr=False
+    )

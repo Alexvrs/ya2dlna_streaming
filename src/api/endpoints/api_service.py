@@ -41,7 +41,7 @@ async def shutdown(request: Request):
 
 @router.get("/status")
 async def status(request: Request):
-    """Состояние стрима: идёт ли и в какой зоне (зона — только OwnTone)."""
+    """Состояние стрима: идёт ли, зона (только OwnTone), следующий трек."""
     output = request.app.state.audio_output
     zone = None
     volumes: dict[str, int | None] = {}
@@ -59,10 +59,13 @@ async def status(request: Request):
                 volumes[name] = await output.get_zone_volume(name)
             except OwnToneError:
                 volumes[name] = None
+    manager = _get_manager(request)
     return {
-        "running": _get_manager(request).is_running,
+        "running": manager.is_running,
         "zone": zone,
         "volumes": volumes,
+        # Следующий трек очереди станции или null (радио, конец очереди)
+        "next": await manager.next_track_info(),
     }
 
 
