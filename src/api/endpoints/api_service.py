@@ -184,7 +184,23 @@ async def zone_volume(request: Request, zone: str, volume: int):
     return {"status": "volume_set", "zone": zone, "volume": level}
 
 
-PLAYER_ACTIONS = ("next", "prev", "play_pause", "like", "dislike")
+PLAYER_ACTIONS = (
+    "next",
+    "prev",
+    "play_pause",
+    "like",
+    "dislike",
+    "dj_on",
+    "dj_off",
+)
+
+# Режим диджея «Моей волны»: отдельной команды glagol нет, Алиса
+# переключает его по фразе (проверено на Станции 07.11.2026; «включи
+# диджея» и «включи кроссфейд» не срабатывают). Состояние не читается.
+DJ_PHRASES = {
+    "dj_on": "включи режим диджей",
+    "dj_off": "выключи режим диджей",
+}
 
 
 async def player_command(manager: MainStreamManager, action: str) -> str:
@@ -212,6 +228,9 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
     if action == "prev":
         await station.prev()
         return "prev"
+    if action in DJ_PHRASES:
+        await station.send_text(DJ_PHRASES[action])
+        return action
     track = await station.get_current_track()
     if action in ("like", "dislike"):
         if track is None or track.type != "Track" or not track.id:
@@ -232,7 +251,11 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
 
 @router.post("/player/{action}")
 async def player_endpoint(request: Request, action: str):
-    """Трек и пауза: next, prev, play_pause; оценка: like, dislike."""
+    """Команды плееру Станции с пульта.
+
+    Трек и пауза: next, prev, play_pause; оценка: like, dislike;
+    режим диджея «Моей волны»: dj_on, dj_off.
+    """
     try:
         result = await player_command(_get_manager(request), action)
     except ValueError as e:

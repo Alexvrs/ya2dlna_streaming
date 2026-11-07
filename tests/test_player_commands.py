@@ -18,7 +18,7 @@ def make_manager(
 ):
     """Менеджер с замоканными контролами Станции и API Музыки."""
     station = MagicMock()
-    for name in ("next", "prev", "play", "stop"):
+    for name in ("next", "prev", "play", "stop", "send_text"):
         setattr(station, name, AsyncMock())
     track = (
         None
@@ -129,3 +129,21 @@ async def test_music_api_like_inits_account_once():
     assert await api.like_track("43") is True
     client.init.assert_awaited_once()
     client.users_likes_tracks_add.assert_awaited_with("43")
+
+
+@pytest.mark.parametrize(
+    "action, phrase",
+    [("dj_on", "включи режим диджей"), ("dj_off", "выключи режим диджей")],
+)
+async def test_dj_mode_sends_phrase(action, phrase):
+    manager, station = make_manager(running=True, playing=True)
+    assert await player_command(manager, action) == action
+    station.send_text.assert_awaited_once_with(phrase)
+    station.get_current_track.assert_not_awaited()
+
+
+async def test_dj_mode_refused_when_stream_stopped():
+    manager, station = make_manager(running=False, playing=True)
+    with pytest.raises(RuntimeError):
+        await player_command(manager, "dj_on")
+    station.send_text.assert_not_awaited()
