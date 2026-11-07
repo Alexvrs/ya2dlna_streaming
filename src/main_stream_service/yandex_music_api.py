@@ -52,6 +52,21 @@ class YandexMusicAPI:
     def __init__(self, client: ClientAsync):
         self._client = client
 
+    async def _ensure_account(self) -> None:
+        """Лайки пишутся в аккаунт: клиенту нужен uid (client.init)."""
+        if self._client.me is None:
+            await self._client.init()
+
+    async def like_track(self, track_id: str | int) -> bool:
+        """Отметить трек «Нравится» в аккаунте Яндекс Музыки."""
+        await self._ensure_account()
+        return bool(await self._client.users_likes_tracks_add(track_id))
+
+    async def dislike_track(self, track_id: str | int) -> bool:
+        """Отметить трек «Не нравится» в аккаунте Яндекс Музыки."""
+        await self._ensure_account()
+        return bool(await self._client.users_dislikes_tracks_add(track_id))
+
     async def get_track_meta(self, track_id: str | int) -> TrackInfo:
         """Название, исполнители, альбом и обложка трека.
 

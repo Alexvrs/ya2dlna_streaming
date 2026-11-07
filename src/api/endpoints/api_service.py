@@ -2,6 +2,7 @@ import asyncio
 from logging import getLogger
 
 from fastapi import APIRouter, HTTPException, Request
+from yandex_music.exceptions import YandexMusicError
 
 from core.config.settings import settings
 from main_stream_service.main_stream_manager import MainStreamManager
@@ -183,7 +184,7 @@ async def zone_volume(request: Request, zone: str, volume: int):
     return {"status": "volume_set", "zone": zone, "volume": level}
 
 
-PLAYER_ACTIONS = ("next", "prev", "play_pause")
+PLAYER_ACTIONS = ("next", "prev", "play_pause", "like", "dislike")
 
 
 async def player_command(manager: MainStreamManager, action: str) -> str:
@@ -192,10 +193,13 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
     Стрим сам следует за Станцией: смена трека, пауза и продолжение
     подхватываются циклом менеджера, поэтому достаточно отдать команду
     Станции. Пауза/продолжение — по тому, играет ли Станция сейчас.
+    Лайк и дизлайк — текущему треку в аккаунте Яндекс Музыки; после
+    дизлайка — следующий трек, как в самой Музыке.
 
     Raises:
         ValueError: неизвестная команда.
         RuntimeError: стрим не идёт — Станцией управляет она сама.
+        LookupError: лайк/дизлайк, а сейчас играет не трек (радио).
     """
     if action not in PLAYER_ACTIONS:
         raise ValueError(f"Неизвестная команда «{action}»")
@@ -209,6 +213,16 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
         await station.prev()
         return "prev"
     track = await station.get_current_track()
+    if action in ("like", "dislike"):
+        if track is None or track.type != "Track" or not track.id:
+            raise LookupError("Сейчас играет не трек")
+        music = manager.yandex_music_api
+        if action == "like":
+            await music.like_track(track.id)
+            return "liked"
+        await music.dislike_track(track.id)
+        await station.next()
+        return "disliked"
     if track is not None and track.playing:
         await station.stop()
         return "paused"
@@ -218,11 +232,13 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
 
 @router.post("/player/{action}")
 async def player_endpoint(request: Request, action: str):
-    """Следующий/предыдущий трек и пауза: next, prev, play_pause."""
+    """Трек и пауза: next, prev, play_pause; оценка: like, dislike."""
     try:
         result = await player_command(_get_manager(request), action)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    except RuntimeError as e:
+    except (RuntimeError, LookupError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
+    except YandexMusicError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
     return {"status": result}

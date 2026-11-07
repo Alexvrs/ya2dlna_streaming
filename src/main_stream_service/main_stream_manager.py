@@ -145,6 +145,11 @@ class MainStreamManager:
         """Управление Станцией (команды плееру с пульта, API /player)."""
         return self._station_controls
 
+    @property
+    def yandex_music_api(self) -> YandexMusicAPI:
+        """API Яндекс Музыки (лайк/дизлайк с пульта, API /player)."""
+        return self._yandex_music_api
+
     async def start(self):
         """Запуск всех стриминговых процессов."""
         if self._stream_state_running or self._tasks:
