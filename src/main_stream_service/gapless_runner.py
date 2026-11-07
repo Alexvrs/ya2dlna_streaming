@@ -1,0 +1,388 @@
+"""Исполнитель бесшовного режима: решатель → сервер потока и Станция.
+
+Менеджер на каждой итерации отдаёт сюда снимок Станции; решатель
+(``GaplessDecider``) говорит, что делать, исполнитель делает:
+
+- сессия: ``/gapless/start`` на сервере потока и поток в OwnTone;
+- сегменты: ссылка трека (кеш/предзагрузка менеджера), описание для
+  ICY, позиция со сдвигом на D для синхронного режима;
+- Станция гаснет в момент, когда колонки зазвучали (событие + D);
+- задержка D меряется по ``item_progress_ms`` OwnTone (опыт E4).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from logging import getLogger
+from typing import Any, Awaitable, Callable
+
+import aiohttp
+
+from core.config.settings import settings
+from main_stream_service.gapless_decider import (
+    Action,
+    AddSegment,
+    EndSegment,
+    Fallback,
+    GaplessDecider,
+    Prepare,
+    Snapshot,
+    StartSession,
+    StopSession,
+    UnmuteStation,
+)
+from main_stream_service.yandex_music_api import TrackInfo, TrackSource
+from yandex_station.models import Track
+
+logger = getLogger(__name__)
+
+SAMPLE_RATE = 44100
+# Буфер OwnTone до старта (опыт E3c) — для оценки D до первого замера
+OWNTONE_START_BUFFER = 2.8
+DELAY_MEASURE_INTERVAL = 10.0
+# Станцию гасить чуть позже момента, когда колонки зазвучали
+FADE_AFTER_AUDIBLE = 0.3
+# Нет ссылки трека — повтор запроса не чаще, секунд
+LINK_RETRY = 5.0
+
+
+class GaplessLost(Exception):
+    """Сервер потока не знает сессии (перезапущен) — начать заново."""
+
+
+class GaplessRunner:
+    """Связывает решатель с сервером потока, OwnTone и Станцией."""
+
+    def __init__(
+        self,
+        station: Any,
+        output: Any,
+        resolve_source: Callable[[str], Awaitable[TrackSource | None]],
+        track_info: Callable[[str], Awaitable[TrackInfo]],
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.decider = GaplessDecider()
+        self._station = station
+        self._output = output
+        self._resolve_source = resolve_source
+        self._track_info = track_info
+        self._clock = clock
+        self._base = (
+            f"http://{settings.local_server_host}:"
+            f"{settings.local_server_port_dlna}"
+        )
+        self.delay = (
+            OWNTONE_START_BUFFER
+            + settings.gapless_lead
+            + settings.gapless_margin
+        )
+        self.delay_measured = False
+        self._last_measure = 0.0
+        self._session: dict[str, Any] | None = None
+        self._fade_task: asyncio.Task[None] | None = None
+        self._fading = False
+        self._silent_checks = 0
+        self._link_failed: dict[str, float] = {}
+        self._bg: set[asyncio.Task[None]] = set()
+
+    @property
+    def fade_pending(self) -> bool:
+        """Гашение Станции запланировано или идёт."""
+        return self._fade_task is not None and not self._fade_task.done()
+
+    @property
+    def active(self) -> bool:
+        """Идёт ли бесшовная сессия."""
+        return self.decider.session
+
+    # --- цикл ---------------------------------------------------------------
+
+    async def handle(self, track: Track, alice: str | None) -> bool:
+        """Обрабатывает снимок Станции.
+
+        Ошибка одного действия (сеть, OwnTone) не роняет цикл: состояние
+        решателя откатывается, следующий снимок повторит попытку.
+
+        Returns:
+            True — случай не бесшовный (радио), нужен классический путь.
+        """
+        snap = Snapshot(
+            t=track.captured_at,
+            track_id=track.id,
+            playing=track.playing,
+            progress=track.progress,
+            duration=track.duration,
+            alice=alice,
+            type=track.type,
+            next_id=track.next_id,
+        )
+        self.decider.delay = self.delay
+        for act in self.decider.feed(snap):
+            if isinstance(act, Fallback):
+                return True
+            try:
+                await self._do(act, track)
+            except GaplessLost as e:
+                logger.warning(f"⚠️ Бесшовная сессия потеряна ({e}) — заново")
+                await self._lose_session()
+                break
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Бесшовный режим: {type(act).__name__}: {e}"
+                )
+                await self._rollback(act)
+                break
+        await self._check_output()
+        return False
+
+    async def stop(self) -> None:
+        """Останавливает сессию (стоп стрима)."""
+        await self._cancel_fade()
+        for task in list(self._bg):
+            task.cancel()
+        if self.decider.session or self._session:
+            try:
+                await self._post("/gapless/stop", {})
+            except Exception as e:
+                logger.debug(f"gapless/stop: {e}")
+        self.decider.reset()
+        self._session = None
+
+    async def _lose_session(self) -> None:
+        """Сессия пропала или колонки молчат: Станция громкая, заново."""
+        await self._cancel_fade()
+        self.decider.reset()
+        self._session = None
+        try:
+            await self._station.unmute()
+        except Exception as e:
+            logger.debug(f"unmute: {e}")
+
+    async def _rollback(self, act: Action) -> None:
+        if isinstance(act, AddSegment):
+            self.decider.seg_open = False  # следующий снимок повторит
+        elif isinstance(act, (StartSession, StopSession)):
+            if isinstance(act, StartSession):
+                try:
+                    await self._post("/gapless/stop", {})
+                except Exception:
+                    pass
+            await self._lose_session()
+
+    # --- действия -----------------------------------------------------------
+
+    async def _do(self, act: Action, track: Track) -> None:
+        if isinstance(act, StartSession):
+            await self._start_session()
+        elif isinstance(act, AddSegment):
+            await self._add_segment(act, track)
+        elif isinstance(act, EndSegment):
+            t = act.t - (self.delay if act.sync else 0.0)
+            await self._post("/gapless/end", {"t_station": t})
+        elif isinstance(act, Prepare):
+            self._spawn(self._prepare(act.track_id))
+        elif isinstance(act, UnmuteStation):
+            logger.info(f"🔊 Станция громкая: {act.reason}")
+            await self._cancel_fade()
+            await self._station.unmute()
+        elif isinstance(act, StopSession):
+            logger.info(f"⏹ Бесшовная сессия: стоп ({act.reason})")
+            await self._cancel_fade()
+            self._session = None
+            try:
+                await self._post("/gapless/stop", {})
+                await self._output.stop()
+            except GaplessLost:
+                pass
+            finally:
+                await self._station.unmute()
+
+    async def _start_session(self) -> None:
+        # Станция могла остаться приглушённой (радио, потерянная сессия):
+        # первые D секунд синхронного трека играет она
+        await self._station.unmute()
+        self._session = await self._post("/gapless/start", {})
+        url = self._base + str(self._session["stream_path"])
+        self.delay_measured = False
+        self._silent_checks = 0
+        await self._output.set_av_transport_uri(url)
+        await self._output.play()
+        logger.info(f"▶️ Бесшовный поток в OwnTone: {url}")
+
+    async def _add_segment(self, act: AddSegment, track: Track) -> None:
+        failed_at = self._link_failed.get(act.track_id)
+        if failed_at is not None and self._clock() - failed_at < LINK_RETRY:
+            self.decider.seg_open = False
+            return
+        source, info = await asyncio.gather(
+            self._resolve_source(act.track_id), self._track_info(act.track_id)
+        )
+        if source is None:
+            logger.warning(f"⚠️ Нет ссылки трека {act.track_id} — повторим")
+            self._link_failed[act.track_id] = self._clock()
+            self.decider.seg_open = False
+            return
+        self._link_failed.pop(act.track_id, None)
+        pos = act.pos + (self.delay if act.sync else 0.0)
+        same = track.id == act.track_id
+        body = {
+            "track_id": act.track_id,
+            "t_station": act.t,
+            "pos": pos,
+            "url": source.url,
+            "title": (track.title if same else "") or info.title,
+            "artist": (track.artist if same else "") or info.artist,
+            "album": info.album,
+            "cover": (track.cover if same else None) or info.cover or "",
+        }
+        await self._post("/gapless/segment", body)
+        mode = "вровень" if act.sync else "зеркало"
+        logger.info(
+            f"🧩 Сегмент {act.track_id} ({mode}): позиция {pos:.1f}с, "
+            f"D={self.delay:.2f}с"
+        )
+        if act.fade_station:
+            await self._schedule_fade(act.t + self.delay + FADE_AFTER_AUDIBLE)
+
+    async def _prepare(self, track_id: str) -> None:
+        try:
+            source = await self._resolve_source(track_id)
+            info = await self._track_info(track_id)
+            if source is None or not self.decider.session:
+                return
+            await self._post(
+                "/gapless/prepare",
+                {
+                    "track_id": track_id,
+                    "url": source.url,
+                    "cover": info.cover or "",
+                },
+            )
+            logger.info(f"📦 Декодер следующего трека {track_id} готовится")
+        except Exception as e:
+            logger.debug(f"Предзапуск {track_id}: {e}")
+
+    # --- громкость Станции -----------------------------------------------
+
+    async def _schedule_fade(self, at: float) -> None:
+        await self._cancel_fade()
+        self._fade_task = asyncio.create_task(self._fade_at(at))
+
+    async def _fade_at(self, at: float) -> None:
+        wait = at - self._clock()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        if not await self._output_playing():
+            # Колонки молчат — Станцию не гасим, иначе тишина везде
+            logger.warning("⚠️ Колонки не играют — Станция остаётся громкой")
+            return
+        logger.info("🔉 Колонки зазвучали — Станция гаснет")
+        self._fading = True
+        try:
+            await self._station.fade_out_alice_volume(wait=0, delay=0.05)
+            self.decider.station_faded()
+        finally:
+            self._fading = False
+
+    async def _cancel_fade(self) -> None:
+        """Отменяет ожидание гашения; начатое гашение доводит до конца.
+
+        Гашение, оборванное на середине, оставило бы Станцию тихой с
+        неверно запомненной громкостью (unmute её бы не вернул).
+        """
+        task, self._fade_task = self._fade_task, None
+        if task is None or task.done():
+            return
+        if self._fading:
+            await asyncio.shield(task)
+            return
+        task.cancel()
+
+    # --- страховка и задержка D ------------------------------------------------
+
+    async def _output_playing(self) -> bool:
+        progress = getattr(self._output, "player_progress", None)
+        if progress is None:
+            return True
+        try:
+            player = await progress()
+        except Exception:
+            return False
+        return player is not None and player[0] == "play"
+
+    async def _check_output(self) -> None:
+        """Раз в 10 с: колонки играют? замер D; страховка от тишины."""
+        now = self._clock()
+        if not self.decider.session or self._session is None:
+            return
+        if now - self._last_measure < DELAY_MEASURE_INTERVAL:
+            return
+        self._last_measure = now
+        progress = getattr(self._output, "player_progress", None)
+        if progress is None:
+            return
+        try:
+            player = await progress()
+            heard_at = self._clock()
+            state = await self._get("/gapless/state")
+        except Exception as e:
+            logger.debug(f"Проверка колонок: {e}")
+            return
+        if player is None or player[0] != "play":
+            self._silent_checks += 1
+            if self._silent_checks >= 2 and now - self._started_at() > 15:
+                logger.warning(
+                    "⚠️ Колонки не играют бесшовный поток — "
+                    "Станция громкая, сессия заново"
+                )
+                try:
+                    await self._post("/gapless/stop", {})
+                except Exception:
+                    pass
+                await self._lose_session()
+            return
+        self._silent_checks = 0
+        start = state.get("client_start_frame")
+        t0 = state.get("t0")
+        if start is None or t0 is None:
+            return
+        heard = float(t0) + (int(start) + player[1] * SAMPLE_RATE / 1000) / (
+            SAMPLE_RATE
+        )
+        delay = heard_at - heard
+        if 2.0 < delay < 15.0:
+            if abs(delay - self.delay) > 0.2 or not self.delay_measured:
+                logger.info(f"⏱ Задержка колонок D = {delay:.2f}с")
+            self.delay = delay
+            self.delay_measured = True
+
+    def _started_at(self) -> float:
+        if self._session is None:
+            return self._clock()
+        return float(self._session.get("w_start", self._clock()))
+
+    # --- HTTP -------------------------------------------------------------
+
+    async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.post(self._base + path, json=body) as resp:
+                if resp.status == 409:
+                    raise GaplessLost(await resp.text())
+                resp.raise_for_status()
+                data = await resp.json()
+                return data if isinstance(data, dict) else {}
+
+    async def _get(self, path: str) -> dict[str, Any]:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.get(self._base + path) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                return data if isinstance(data, dict) else {}
+
+    def _spawn(self, coro: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)

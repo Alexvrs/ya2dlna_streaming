@@ -63,6 +63,17 @@ class Settings(BaseSettings):
     # порядок событий на стыке треков). По умолчанию выключен
     station_raw_log: bool = False
 
+    # Бесшовный поток (только output_backend=owntone): один непрерывный
+    # WAV в OwnTone, треки по расписанию Станции с задержкой D (план,
+    # раздел 0). По умолчанию выключен — классический путь
+    gapless: bool = False
+    # Писатель опережает реальное время не больше чем на lead секунд
+    gapless_lead: float = 1.0
+    # Запас на опоздание событий Станции и запуск декодера, секунды.
+    # D ≈ буфер OwnTone (~3 с) + lead + margin. Запас должен покрыть
+    # опоздание события (~1,3 с) и запуск декодера (1,1–1,5 с, E6)
+    gapless_margin: float = 2.5
+
     # Stream settings
     stream_quality: str = "192"
     stream_is_local_file: bool = False

@@ -10,6 +10,7 @@ from injector import inject
 from core.audio_output import AudioOutput
 from core.config.settings import settings
 from core.http_redirects import try_resolve_redirects
+from main_stream_service.gapless_runner import GaplessRunner
 from main_stream_service.yandex_music_api import (
     TrackInfo,
     TrackSource,
@@ -134,6 +135,15 @@ class MainStreamManager:
         self._transition_seq = 0
         # Последний трек со станции — источник «следующего» для /status
         self._last_track: Track | None = None
+        # Бесшовный режим (план, раздел 0): только OwnTone, по флагу
+        self._gapless_runner: GaplessRunner | None = None
+        if settings.gapless and settings.output_backend == "owntone":
+            self._gapless_runner = GaplessRunner(
+                self._station_controls,
+                self._ruark_controls,
+                self._resolve_track_source,
+                self._track_info,
+            )
 
     @property
     def is_running(self) -> bool:
@@ -201,6 +211,8 @@ class MainStreamManager:
         self._stream_state_running = False
         self._last_track = None
         await self._remember_ruark_volume()
+        if self._gapless_runner is not None:
+            await self._safe_stop_step(self._gapless_runner.stop)
         await self._safe_stop_step(self._ruark_controls.stop)
         await self._safe_stop_step(self._stop_stream_on_stream_server)
         # Нулевой снапшот на устройство не возвращаем: следующий сеанс
@@ -276,6 +288,13 @@ class MainStreamManager:
                     continue
                 alice_state = await self._station_controls.get_alice_state()
 
+                if await self._gapless_cycle(track, alice_state, ctx):
+                    self._finish_iteration(track, alice_state, ctx)
+                    await self._ws_client.wait_for_state_update(
+                        STREAM_POLL_INTERVAL
+                    )
+                    continue
+
                 await self._duck_ruark_on_alice_speech(alice_state, ctx)
 
                 if alice_state == "IDLE":
@@ -283,12 +302,7 @@ class MainStreamManager:
 
                 await self._unmute_before_track_end(track, alice_state)
 
-                self._log_current_track(track, alice_state, ctx)
-                self._last_track = track
-                ctx.last_track_progress = track.progress
-                ctx.last_progress_at = track.captured_at
-                ctx.last_track_playing = track.playing
-                ctx.last_alice_state = alice_state
+                self._finish_iteration(track, alice_state, ctx)
                 # Новое сообщение станции будит цикл сразу,
                 # таймаут — heartbeat для проверок по времени
                 await self._ws_client.wait_for_state_update(
@@ -300,6 +314,79 @@ class MainStreamManager:
         except Exception as e:
             logger.error(f"❌ Ошибка в стриминге: {e}")
             raise
+
+    def _finish_iteration(
+        self, track: Track, alice_state: str | None, ctx: "_CycleContext"
+    ) -> None:
+        """Запоминает снимок итерации для сравнения на следующей."""
+        self._log_current_track(track, alice_state, ctx)
+        self._last_track = track
+        ctx.last_track_progress = track.progress
+        ctx.last_progress_at = track.captured_at
+        ctx.last_track_playing = track.playing
+        ctx.last_alice_state = alice_state
+
+    async def _gapless_cycle(
+        self, track: Track, alice_state: str | None, ctx: "_CycleContext"
+    ) -> bool:
+        """Итерация бесшовного режима.
+
+        Returns:
+            True — итерация обработана; False — классический путь
+            (режим выключен или играет радио).
+        """
+        runner = self._gapless_runner
+        if runner is None:
+            return False
+        was_active = runner.active
+        if await runner.handle(track, alice_state):
+            if was_active:
+                # Сессия закрыта ради радио — классический путь должен
+                # увидеть «новый» трек и запустить поток
+                ctx.last_track = Track(
+                    id="0",
+                    type="",
+                    artist="",
+                    title="",
+                    duration=0,
+                    progress=0,
+                    playing=False,
+                )
+            return False
+        if not was_active and runner.active and ctx.track_url:
+            # После радио классический FFmpeg больше не нужен
+            ctx.track_url = None
+            await self._safe_stop_step(self._stop_stream_on_stream_server)
+        await self._gapless_speech(alice_state, ctx)
+        return True
+
+    async def _gapless_speech(
+        self, alice_state: str | None, ctx: "_CycleContext"
+    ) -> None:
+        """Колонки тише, пока Алиса слушает или отвечает (как раньше).
+
+        После команды колонки возвращают громкость; если трек
+        продолжается без диджея, Станция снова гаснет.
+        """
+        runner = self._gapless_runner
+        await self._duck_ruark_on_alice_speech(alice_state, ctx)
+        if alice_state in ALICE_ACTIVE_STATES:
+            return
+        ctx.volume_set_count = 0
+        if not ctx.speak_count:
+            return
+        await self._restore_ruark_volume(ctx)
+        ctx.speak_count = 0
+        if (
+            runner is not None
+            and runner.active
+            and alice_state == "IDLE"
+            and not runner.decider.station_loud
+            and not runner.fade_pending
+        ):
+            await self._station_controls.fade_out_alice_volume(
+                wait=0, delay=0.05
+            )
 
     async def _duck_ruark_on_alice_speech(
         self, alice_state: str | None, ctx: "_CycleContext"

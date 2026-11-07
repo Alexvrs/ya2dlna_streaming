@@ -12,6 +12,7 @@ from core.dependencies.main_di_container import MainDIContainer
 from core.logging.setup import setup_logging
 from dlna_stream_server.endpoints.routers import main_router
 from dlna_stream_server.handlers.stream_handler import StreamHandler
+from gapless.http import GaplessHub
 
 setup_logging("dlna")
 
@@ -23,6 +24,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Инициализация зависимостей и фоновый поиск Ruark при старте."""
     container = MainDIContainer().get_container()
     app.state.stream_handler = container.get(StreamHandler)
+    app.state.gapless = GaplessHub()
     ruark = container.get(AudioOutput)  # type: ignore[type-abstract]
     connect_task = asyncio.create_task(ruark.connect())
     logger.info("✅ Зависимости DLNA сервера инициализированы")
@@ -32,6 +34,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not connect_task.done():
         connect_task.cancel()
     await app.state.stream_handler.stop_ffmpeg()
+    app.state.gapless.stop()
     logger.info("⏹ DLNA сервер остановлен")
 
 

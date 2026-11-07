@@ -491,6 +491,23 @@ class OwnToneController:
         """Останавливает воспроизведение OwnTone."""
         await self._request("PUT", "/player/stop")
 
+    async def player_progress(self) -> tuple[str, int] | None:
+        """Состояние плеера и позиция элемента (мс) или None.
+
+        Позиция совпадает со слышимым звуком (опыт E4, ±0,03 с) —
+        по ней бесшовный режим меряет задержку колонок от Станции.
+        """
+        try:
+            player = await self._request("GET", "/player")
+        except OwnToneError as e:
+            logger.debug(f"OwnTone: позиция не получена: {e}")
+            return None
+        if not isinstance(player, dict):
+            return None
+        return str(player.get("state")), int(
+            player.get("item_progress_ms") or 0
+        )
+
     async def is_playing(self, timeout: float = 5.0) -> bool:
         """Проверяет, играет ли OwnTone хотя бы на одну колонку."""
         try:
