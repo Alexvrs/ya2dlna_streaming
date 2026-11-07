@@ -181,3 +181,48 @@ async def zone_volume(request: Request, zone: str, volume: int):
     except OwnToneError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"status": "volume_set", "zone": zone, "volume": level}
+
+
+PLAYER_ACTIONS = ("next", "prev", "play_pause")
+
+
+async def player_command(manager: MainStreamManager, action: str) -> str:
+    """Команда плееру Станции с пульта (ресивер «Стрим» в Apple Home).
+
+    Стрим сам следует за Станцией: смена трека, пауза и продолжение
+    подхватываются циклом менеджера, поэтому достаточно отдать команду
+    Станции. Пауза/продолжение — по тому, играет ли Станция сейчас.
+
+    Raises:
+        ValueError: неизвестная команда.
+        RuntimeError: стрим не идёт — Станцией управляет она сама.
+    """
+    if action not in PLAYER_ACTIONS:
+        raise ValueError(f"Неизвестная команда «{action}»")
+    if not manager.is_running:
+        raise RuntimeError("Стрим не идёт")
+    station = manager.station_controls
+    if action == "next":
+        await station.next()
+        return "next"
+    if action == "prev":
+        await station.prev()
+        return "prev"
+    track = await station.get_current_track()
+    if track is not None and track.playing:
+        await station.stop()
+        return "paused"
+    await station.play()
+    return "playing"
+
+
+@router.post("/player/{action}")
+async def player_endpoint(request: Request, action: str):
+    """Следующий/предыдущий трек и пауза: next, prev, play_pause."""
+    try:
+        result = await player_command(_get_manager(request), action)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"status": result}

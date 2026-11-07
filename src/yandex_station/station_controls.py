@@ -58,6 +58,14 @@ class YandexStationControls:
         """Остановка воспроизведения."""
         await self._ws_client.send_command({"command": "stop"})
 
+    async def next(self):
+        """Следующий трек."""
+        await self._ws_client.send_command({"command": "next"})
+
+    async def prev(self):
+        """Предыдущий трек."""
+        await self._ws_client.send_command({"command": "prev"})
+
     async def send_text(self, text: str):
         """Отправка текстового сообщения."""
         logger.info(f"🔊 Отправка текстового сообщения: {text}")

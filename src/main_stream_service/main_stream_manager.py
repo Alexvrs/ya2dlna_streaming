@@ -140,6 +140,11 @@ class MainStreamManager:
         """Идёт ли сейчас стриминг."""
         return self._stream_state_running
 
+    @property
+    def station_controls(self) -> YandexStationControls:
+        """Управление Станцией (команды плееру с пульта, API /player)."""
+        return self._station_controls
+
     async def start(self):
         """Запуск всех стриминговых процессов."""
         if self._stream_state_running or self._tasks:
