@@ -713,7 +713,7 @@ async def test_start_announces_missing_ruark_by_voice():
 
     station.say.assert_awaited_once()
     phrase = station.say.call_args.args[0]
-    assert "Руарк" in phrase
+    assert "колонки" in phrase
 
 
 async def test_start_stays_silent_when_station_unreachable():

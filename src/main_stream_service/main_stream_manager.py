@@ -42,8 +42,8 @@ from yandex_station.station_ws_control import YandexStationClient
 logger = getLogger(__name__)
 
 # Фразы голосовых уведомлений об ошибках (озвучивает станция)
-RUARK_MISSING_PHRASE = "Стрим не запустился: не вижу Руарк в сети"
-RUARK_SILENT_PHRASE = "Руарк не отвечает, возвращаю звук на станцию"
+RUARK_MISSING_PHRASE = "Стрим не запустился: не вижу колонки в сети"
+RUARK_SILENT_PHRASE = "Колонки не отвечают, возвращаю звук на станцию"
 STREAM_BROKEN_PHRASE = (
     "Стрим сломался и сам не восстанавливается, загляни в логи"
 )
