@@ -45,6 +45,10 @@ DELAY_MEASURE_INTERVAL = 10.0
 FADE_AFTER_AUDIBLE = 0.3
 # Нет ссылки трека — повтор запроса не чаще, секунд
 LINK_RETRY = 5.0
+# Название потока в очереди OwnTone. Без него OwnTone показывает имя
+# файла (s1.wav); исполнитель и трек приходят по ICY в поля «исполнитель»
+# и «альбом»
+GAPLESS_STREAM_TITLE = "Stream Yandex Station"
 
 
 class GaplessLost(Exception):
@@ -206,7 +210,9 @@ class GaplessRunner:
         url = self._base + str(self._session["stream_path"])
         self.delay_measured = False
         self._silent_checks = 0
-        await self._output.set_av_transport_uri(url)
+        await self._output.set_av_transport_uri(
+            url, title=GAPLESS_STREAM_TITLE
+        )
         await self._output.play()
         logger.info(f"▶️ Бесшовный поток в OwnTone: {url}")
 

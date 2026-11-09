@@ -27,6 +27,7 @@ class Output:
 
     async def set_av_transport_uri(self, url, title="", artist="", **_):
         self.calls.append(("uri", url))
+        self.title = title
 
     async def play(self):
         self.calls.append("play")
@@ -106,6 +107,8 @@ async def test_start_opens_session_and_plays_stream(env):
     assert posts[0][0] == "/gapless/start"
     out = runner._output.calls
     assert out[0][0] == "uri" and out[0][1].endswith("/live/s1.wav")
+    # В очереди OwnTone — название потока, а не имя файла
+    assert runner._output.title == "Stream Yandex Station"
     assert out[1] == "play"
     seg = segs(posts)[0]
     # Синхронный старт: позиция сдвинута на D

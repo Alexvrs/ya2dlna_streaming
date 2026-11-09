@@ -264,7 +264,8 @@ async def live(request: Request, name: str) -> Response:
     logger.info(f"🔌 Клиент потока {name}: {ua} (ICY: {icy})")
     if icy:
         headers["icy-metaint"] = str(IcyInterleaver().metaint)
-        headers["icy-name"] = "Yandex Station"  # заголовки — только latin-1
+        # Заголовки — только latin-1
+        headers["icy-name"] = "Stream Yandex Station"
     return StreamingResponse(
         _body(session, icy), media_type="audio/wav", headers=headers
     )
