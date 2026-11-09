@@ -528,14 +528,15 @@ class OwnToneController:
         """Возвращает заглушку: OwnTone сессии не требует."""
         return "owntone"
 
-    async def get_power_status(self) -> str:
-        """Возвращает "1", если выбрана хоть одна колонка зоны, иначе "0"."""
+    async def is_powered_on(self) -> bool:
+        """Проверяет, выбрана ли хоть одна колонка зоны."""
         outputs = await self._refresh_outputs()
         names = set(self._zone_output_names(self.current_zone()))
-        selected = any(
-            o.get("selected") for n, o in outputs.items() if n in names
-        )
-        return "1" if selected else "0"
+        return any(o.get("selected") for n, o in outputs.items() if n in names)
+
+    async def set_mode(self, mode_id: str) -> bool:
+        """Режимов источника у OwnTone нет — ничего не делает."""
+        return True
 
     async def turn_power_on(self) -> bool:
         """Выбирает колонки текущей зоны."""

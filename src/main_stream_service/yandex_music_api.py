@@ -10,6 +10,7 @@ from yandex_music import ClientAsync
 from yandex_music.utils.sign_request import DEFAULT_SIGN_KEY
 
 from core.config.settings import settings
+from core.enums import Codec
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,9 @@ MUSIC_CLIENT_HEADERS = {
     "X-Yandex-Music-Client": "YandexMusicAndroid/24023621",
 }
 
+# Имена кодеков в API Яндекса здесь строки, а не перечисление Codec:
+# у API свои имена (flac-mp4, he-aac). В Codec их переводит
+# get_track_source
 LOSSLESS_CODECS = "flac,flac-mp4,mp3,aac,he-aac,aac-mp4,he-aac-mp4"
 
 
@@ -29,7 +33,7 @@ class TrackSource:
     """Источник потока трека: прямая ссылка и кодек."""
 
     url: str
-    codec: str  # "flac" | "mp3"
+    codec: Codec
     # Перенаправления уже пройдены: url — конечный адрес CDN
     resolved: bool = False
 
@@ -107,7 +111,7 @@ class YandexMusicAPI:
         if settings.prefer_lossless:
             lossless_url = await self._get_lossless_url(track_id)
             if lossless_url:
-                return TrackSource(url=lossless_url, codec="flac")
+                return TrackSource(url=lossless_url, codec=Codec.FLAC)
 
         # Только MP3: без фильтра «лучшим по битрейту» может оказаться
         # AAC, а его копирование в MP3-контейнер роняет FFmpeg
@@ -115,13 +119,13 @@ class YandexMusicAPI:
             track_id, quality=quality, codecs="mp3"
         )
         if mp3_url:
-            return TrackSource(url=mp3_url, codec="mp3")
+            return TrackSource(url=mp3_url, codec=Codec.MP3)
 
         # У трека нет MP3 вовсе — разово спасаемся lossless
         if not settings.prefer_lossless:
             lossless_url = await self._get_lossless_url(track_id)
             if lossless_url:
-                return TrackSource(url=lossless_url, codec="flac")
+                return TrackSource(url=lossless_url, codec=Codec.FLAC)
         return None
 
     async def _get_lossless_url(self, track_id: str | int) -> str | None:
@@ -147,8 +151,9 @@ class YandexMusicAPI:
             ).digest()
             params["sign"] = base64.b64encode(digest).decode()[:-1]
 
+            token = settings.ya_music_token.get_secret_value()
             headers = dict(MUSIC_CLIENT_HEADERS)
-            headers["Authorization"] = f"OAuth {settings.ya_music_token}"
+            headers["Authorization"] = f"OAuth {token}"
 
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:

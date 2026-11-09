@@ -1,3 +1,7 @@
+from core.enums import Codec
+
+# Значения после -f ниже — имена форматов FFmpeg, а не перечисление
+# Codec: у AAC-радио формат adts
 FFMPEG_MP3_PARAMS = [
     "ffmpeg",
     "-rw_timeout",
@@ -62,6 +66,9 @@ FFMPEG_LOCAL_MP3_PARAMS = [
     "pipe:1",
 ]
 
+# Параметры для радио: AAC вещателя копируется в ADTS без перекодирования.
+# Без aac_adtstoasc кадры идут с заголовками вещателя как есть, а не
+# с заголовками, пересобранными по первому кадру
 FFMPEG_AAC_PARAMS = [
     "ffmpeg",
     "-re",
@@ -85,9 +92,7 @@ FFMPEG_AAC_PARAMS = [
     "{yandex_url}",
     "-vn",
     "-c:a",
-    "aac",
-    "-bsf:a",
-    "aac_adtstoasc",
+    "copy",
     "-f",
     "adts",
     "-bufsize",
@@ -123,20 +128,20 @@ FFMPEG_FLAC_PARAMS = [
 
 # MIME-типы потоков по кодеку (Content-Type HTTP-ответа)
 STREAM_MIME_TYPES = {
-    "mp3": "audio/mpeg",
-    "flac": "audio/flac",
-    "aac": "audio/aac",
+    Codec.MP3: "audio/mpeg",
+    Codec.FLAC: "audio/flac",
+    Codec.AAC: "audio/aac",
 }
 
 # Диагностика темпа подачи: длина окна замера и пороги скорости
 # по кодеку, ниже которых подача считается медленнее реального
 # времени (кбит/с). Пороги — с запасом ниже типичных битрейтов:
-# FLAC ~1000-1400, MP3 320, радио-AAC ~128
+# FLAC ~1000-1400, MP3 320, радио-AAC ~112
 STREAM_RATE_WINDOW = 30.0
 STREAM_RATE_THRESHOLDS_KBPS = {
-    "flac": 700,
-    "mp3": 250,
-    "aac": 90,
+    Codec.FLAC: 700,
+    Codec.MP3: 250,
+    Codec.AAC: 90,
 }
 
 # Завершение процесса FFmpeg: сколько ждать после SIGTERM и SIGKILL
@@ -153,7 +158,7 @@ RUARK_RECONNECT_COOLDOWN = 30.0
 # Ресурс, объявленный как audio/aac, Ruark качает, но не воспроизводит —
 # ADTS-поток радио играет только под вывеской audio/mpeg
 DIDL_MIME_TYPES = {
-    "mp3": "audio/mpeg",
-    "flac": "audio/flac",
-    "aac": "audio/mpeg",
+    Codec.MP3: "audio/mpeg",
+    Codec.FLAC: "audio/flac",
+    Codec.AAC: "audio/mpeg",
 }

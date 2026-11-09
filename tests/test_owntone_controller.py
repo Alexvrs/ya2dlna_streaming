@@ -215,10 +215,10 @@ async def test_unknown_zone_rejected(fake, tmp_path):
 
 async def test_power_follows_zone_selection(fake, tmp_path):
     ctl = make_controller(fake, tmp_path)
-    assert await ctl.get_power_status() == "0"
+    assert not await ctl.is_powered_on()
 
     await ctl.turn_power_on()
-    assert await ctl.get_power_status() == "1"
+    assert await ctl.is_powered_on()
 
     await ctl.set_av_transport_uri(STREAM_URL)
     await ctl.play()

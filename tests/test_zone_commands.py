@@ -33,8 +33,8 @@ async def test_on_starts_stream_when_stopped():
     manager, owntone = make(running=False, current="Обитель")
     assert await zone_on(manager, owntone, "Спальня") == "started"
     await asyncio.sleep(0)
-    assert api_service._start_task is not None
-    await api_service._start_task
+    assert api_service._start_tasks
+    await asyncio.gather(*api_service._start_tasks)
     manager.start.assert_awaited_once()
     assert owntone.current_zone() == "Спальня"
 

@@ -1,14 +1,18 @@
 import asyncio
 import time
 from dataclasses import dataclass
+from enum import Enum, auto
 from logging import getLogger
 from typing import Any, Awaitable, Callable, TypedDict
 
 import aiohttp
 from injector import inject
+from pydantic import JsonValue
 
 from core.audio_output import AudioOutput
+from core.backoff import ExponentialBackoff
 from core.config.settings import settings
+from core.enums import AliceState, Codec, TrackType
 from core.http_redirects import try_resolve_redirects
 from main_stream_service.gapless_runner import GaplessRunner
 from main_stream_service.yandex_music_api import (
@@ -16,7 +20,12 @@ from main_stream_service.yandex_music_api import (
     TrackSource,
     YandexMusicAPI,
 )
-from ruark_audio_system.exceptions import RuarkDeviceNotFoundError
+from ruark_audio_system.constants import RUARK_RESTING_MODE
+from ruark_audio_system.exceptions import (
+    RuarkApiError,
+    RuarkDeviceNotFoundError,
+    RuarkUnavailableError,
+)
 from ruark_audio_system.volume_store import RuarkVolumeStore
 from yandex_station.constants import (
     ALICE_ACTIVE_STATES,
@@ -24,14 +33,21 @@ from yandex_station.constants import (
     OUTPUT_START_TIMEOUT,
     PROGRESS_JUMP_THRESHOLD,
     RUARK_IDLE_VOLUME,
+    RUARK_MAX_VOLUME,
     RUARK_MIN_START_VOLUME,
+    RUARK_MIN_VOICE_VOLUME,
+    RUARK_OUTAGE_PATIENCE,
+    RUARK_RETRY_INTERVAL,
+    RUARK_VOLUME_PER_STATION_STEP,
     SILENCE_CHECK_INTERVAL,
     SILENCE_RESEND_GRACE,
     SILENT_RESEND_LIMIT,
+    STATION_VOLUME_STEP,
     STREAM_POLL_INTERVAL,
     STREAMING_FAILURE_ANNOUNCE_AFTER,
     STREAMING_FAILURE_STREAK_RESET,
     STREAMING_RESTART_DELAY,
+    STREAMING_RESTART_MAX_DELAY,
     TRACK_SOURCE_CACHE_SIZE,
     TRACK_SOURCE_TTL,
 )
@@ -70,12 +86,28 @@ class NextTrack(TypedDict):
 NEXT_TRACK_INFO_TIMEOUT = 3.0
 
 
+def _radio_source(url: str) -> TrackSource:
+    """Источник радио для отправки на DLNA-сервер: HLS-поток в AAC."""
+    return TrackSource(url=url, codec=Codec.AAC)
+
+
+class _VoiceVolumeCheck(Enum):
+    """Что гашению делать с голосовой громкостью реплики."""
+
+    # Не разбирать: ключ выключен или реплика уже разобрана
+    SKIP = auto()
+    # Первая проверка сдвига не увидела, он мог прийти позже
+    LATE = auto()
+    # Первая проверка уже перенесла сдвиг на Ruark
+    MOVED = auto()
+
+
 @dataclass
 class _CycleContext:
     """Изменяемое состояние цикла стриминга между итерациями."""
 
     last_track: Track
-    last_alice_state: str | None
+    last_alice_state: AliceState | None
     last_track_progress: float = 0.0
     # Момент снятия снапшота прогресса (time.monotonic)
     last_progress_at: float = 0.0
@@ -83,17 +115,24 @@ class _CycleContext:
     stuck_track_count: int = 0
     volume_set_count: int = 0
     speak_count: int = 0
-    track_url: str | None = None
-    last_log_signature: tuple[str, bool, str | None] | None = None
+    # Источник текущего потока: пересылки берут из него ссылку и кодек
+    track_source: TrackSource | None = None
+    last_log_signature: tuple[str, bool, AliceState | None] | None = None
     # Момент последней отправки потока (time.monotonic)
     last_stream_sent_at: float = 0.0
     last_silence_check_at: float = 0.0
     silent_checks: int = 0
     # Пересылки потока подряд, после которых Ruark так и не заиграл
     silent_resends: int = 0
+    # Начало простоя: станция перестала играть (time.monotonic)
+    idle_since: float | None = None
     # Громкость, уже возвращённая Ruark после речи Алисы: защита от
-    # переустановки одного и того же уровня каждую итерацию цикла
+    # переустановки одного и того же уровня каждую итерацию цикла.
+    # None до первого возврата — окно переноса голосовой громкости
     restored_volume: int | None = None
+    # Громкость станции перед репликой Алисы: от неё считаются «громче»
+    # и «тише». None до первой реплики
+    reply_volume: float | None = None
 
 
 class MainStreamManager:
@@ -125,6 +164,10 @@ class MainStreamManager:
         self._ruark_volume = 0
         self._volume_store = RuarkVolumeStore()
         self._stream_state_running = False
+        # Запуск и остановка сеанса не перекрываются
+        self._session_lock = asyncio.Lock()
+        # Запуск уже идёт: повторная команда ничего не делает
+        self._starting = False
         self._tasks = []  # Хранение фоновых задач
         # Ссылка на задачу авто-остановки (Ruark выключен пользователем)
         self._shutdown_task: asyncio.Task[None] | None = None
@@ -135,6 +178,9 @@ class MainStreamManager:
         self._transition_seq = 0
         # Последний трек со станции — источник «следующего» для /status
         self._last_track: Track | None = None
+        # Начало текущей недоступности Ruark (time.monotonic)
+        self._ruark_outage_started_at: float | None = None
+        self._ruark_outage_announced = False
         # Бесшовный режим (план, раздел 0): только OwnTone, по флагу
         self._gapless_runner: GaplessRunner | None = None
         if settings.gapless and settings.output_backend == "owntone":
@@ -160,8 +206,24 @@ class MainStreamManager:
         """API Яндекс Музыки (лайк/дизлайк с пульта, API /player)."""
         return self._yandex_music_api
 
-    async def start(self):
-        """Запуск всех стриминговых процессов."""
+    async def start(self) -> None:
+        """Запуск всех стриминговых процессов.
+
+        Повтор во время запуска ничего не делает.
+        """
+        # Сценарий умного дома иногда шлёт «включи стрим» дважды
+        if self._starting:
+            logger.info("⚠️ Стриминг уже запускается")
+            return
+        self._starting = True
+        try:
+            async with self._session_lock:
+                await self._start_session()
+        finally:
+            self._starting = False
+
+    async def _start_session(self) -> None:
+        """Поднимает сеанс: устройства, WebSocket и цикл стриминга."""
         if self._stream_state_running or self._tasks:
             logger.info("⚠️ Стриминг уже запущен")
             return
@@ -200,33 +262,28 @@ class MainStreamManager:
         logger.info("✅ WebSocket клиент запущен")
         self._tasks.extend([stream_task])
 
-    async def stop(self):
+    async def stop(self) -> None:
         """Остановка всех стриминговых процессов.
+
+        Сначала дожидается завершения идущего запуска.
+        """
+        # Без ожидания запуск поднял бы цикл уже после остановки
+        async with self._session_lock:
+            await self._stop_session()
+
+    async def _stop_session(self) -> None:
+        """Гасит сеанс: фоновые задачи, устройства и WebSocket.
 
         Каждый шаг с устройствами выполняется независимо: недоступный
         Ruark (например, выключен пользователем) не должен прерывать
-        возврат звука на станцию и остановку фоновых задач.
+        возврат звука на станцию.
         """
         logger.info("🛑 Остановка стриминга...")
         self._stream_state_running = False
         self._last_track = None
-        await self._remember_ruark_volume()
-        if self._gapless_runner is not None:
-            await self._safe_stop_step(self._gapless_runner.stop)
-        await self._safe_stop_step(self._ruark_controls.stop)
-        await self._safe_stop_step(self._stop_stream_on_stream_server)
-        # Нулевой снапшот на устройство не возвращаем: следующий сеанс
-        # начался бы с выкрученной в тишину колонки
-        if self._ruark_volume > RUARK_IDLE_VOLUME:
-            await self._safe_stop_step(
-                self._ruark_controls.set_volume, self._ruark_volume
-            )
-        await self._safe_stop_step(self._ruark_controls.turn_power_off)
-        await self._station_controls.unmute()
-        # Остановка WebSocket-клиента
-        await self._station_controls.stop_ws_client()
-
-        # Отмена всех активных задач
+        self._ruark_outage_started_at = None
+        # Цикл гасится до команд устройствам: иначе подготовка только
+        # что поднятого сеанса включила бы Ruark уже после выключения
         for task in self._tasks:
             task.cancel()
         for prefetch_task in self._prefetch_tasks.values():
@@ -240,7 +297,34 @@ class MainStreamManager:
         self._tasks.clear()
         self._prefetch_tasks.clear()
         self._source_cache.clear()
+        if self._gapless_runner is not None:
+            await self._safe_stop_step(self._gapless_runner.stop)
+        await self._remember_ruark_volume()
+        await self._safe_stop_step(self._ruark_controls.stop)
+        await self._safe_stop_step(self._stop_stream_on_stream_server)
+        # Нулевой снапшот на устройство не возвращаем: следующий сеанс
+        # начался бы с выкрученной в тишину колонки
+        if self._ruark_volume > RUARK_IDLE_VOLUME:
+            await self._safe_stop_step(
+                self._ruark_controls.set_volume, self._ruark_volume
+            )
+        await self._safe_stop_step(self._leave_ruark_in_resting_mode)
+        await self._safe_stop_step(self._ruark_controls.turn_power_off)
+        await self._station_controls.unmute()
+        # Остановка WebSocket-клиента
+        await self._station_controls.stop_ws_client()
         logger.info("✅ Стриминг остановлен")
+
+    async def _leave_ruark_in_resting_mode(self) -> None:
+        """Оставляет Ruark в тихом режиме покоя до следующего включения.
+
+        Ruark просыпается в последнем выбранном режиме источника, и из
+        Internet radio первый поток ждёт до минуты. Выключенный
+        пользователем Ruark ради режима не будится.
+        """
+        if not await self._ruark_controls.is_powered_on():
+            return
+        await self._ruark_controls.set_mode(RUARK_RESTING_MODE)
 
     async def _safe_stop_step(
         self,
@@ -255,16 +339,16 @@ class MainStreamManager:
                 f"⚠️ Шаг остановки {func.__name__} не выполнен: {e}"
             )
 
-    async def streaming(self):
+    async def streaming(self) -> None:
         """Основной поток управления стримингом."""
         try:
             logger.info("📡 Поток streaming() стартовал")
-            await self._prepare_devices()
+            await self._prepare_devices_patiently()
 
             ctx = _CycleContext(
                 last_track=Track(
                     id="0",
-                    type="",
+                    type=TrackType.OTHER,
                     artist="",
                     title="",
                     duration=0,
@@ -297,8 +381,15 @@ class MainStreamManager:
 
                 await self._duck_ruark_on_alice_speech(alice_state, ctx)
 
-                if alice_state == "IDLE":
-                    track = await self._handle_idle_cycle(track, ctx)
+                if alice_state == AliceState.IDLE:
+                    try:
+                        track = await self._handle_idle_cycle(track, ctx)
+                        self._clear_ruark_outage()
+                    except RuarkUnavailableError as e:
+                        # Итерация прервана до гашения: станцию слышно, пока
+                        # Ruark молчит. Снимок прогресса ниже обновляется и
+                        # здесь, иначе простой выглядел бы как перемотка
+                        await self._note_ruark_outage(e)
 
                 await self._unmute_before_track_end(track, alice_state)
 
@@ -316,7 +407,10 @@ class MainStreamManager:
             raise
 
     def _finish_iteration(
-        self, track: Track, alice_state: str | None, ctx: "_CycleContext"
+        self,
+        track: Track,
+        alice_state: AliceState | None,
+        ctx: "_CycleContext",
     ) -> None:
         """Запоминает снимок итерации для сравнения на следующей."""
         self._log_current_track(track, alice_state, ctx)
@@ -327,7 +421,10 @@ class MainStreamManager:
         ctx.last_alice_state = alice_state
 
     async def _gapless_cycle(
-        self, track: Track, alice_state: str | None, ctx: "_CycleContext"
+        self,
+        track: Track,
+        alice_state: AliceState | None,
+        ctx: "_CycleContext",
     ) -> bool:
         """Итерация бесшовного режима.
 
@@ -345,7 +442,7 @@ class MainStreamManager:
                 # увидеть «новый» трек и запустить поток
                 ctx.last_track = Track(
                     id="0",
-                    type="",
+                    type=TrackType.OTHER,
                     artist="",
                     title="",
                     duration=0,
@@ -353,15 +450,18 @@ class MainStreamManager:
                     playing=False,
                 )
             return False
-        if not was_active and runner.active and ctx.track_url:
+        if not was_active and runner.active and ctx.track_source:
             # После радио классический FFmpeg больше не нужен
-            ctx.track_url = None
+            ctx.track_source = None
             await self._safe_stop_step(self._stop_stream_on_stream_server)
+        # Автовыключение после долгой паузы — как в классическом пути
+        if alice_state == AliceState.IDLE:
+            self._shutdown_if_idle(track, ctx)
         await self._gapless_speech(alice_state, ctx)
         return True
 
     async def _gapless_speech(
-        self, alice_state: str | None, ctx: "_CycleContext"
+        self, alice_state: AliceState | None, ctx: "_CycleContext"
     ) -> None:
         """Колонки тише, пока Алиса слушает или отвечает (как раньше).
 
@@ -380,7 +480,7 @@ class MainStreamManager:
         if (
             runner is not None
             and runner.active
-            and alice_state == "IDLE"
+            and alice_state == AliceState.IDLE
             and not runner.decider.station_loud
             and not runner.fade_pending
         ):
@@ -389,9 +489,13 @@ class MainStreamManager:
             )
 
     async def _duck_ruark_on_alice_speech(
-        self, alice_state: str | None, ctx: "_CycleContext"
+        self, alice_state: AliceState | None, ctx: "_CycleContext"
     ) -> None:
-        """Приглушает Ruark, когда Алиса начинает говорить или слушать."""
+        """Приглушает Ruark, когда Алиса начинает говорить или слушать.
+
+        Заодно запоминает громкость станции перед репликой — базу
+        голосовой громкости.
+        """
         if alice_state == ctx.last_alice_state:
             return
 
@@ -399,15 +503,69 @@ class MainStreamManager:
         if alice_state in ALICE_ACTIVE_STATES and ctx.volume_set_count < 1:
             ctx.volume_set_count += 1
             ctx.speak_count += 1
+            ctx.restored_volume = None
+            await self._quiet_ruark_for_speech()
 
+            working = self._station_controls.working_volume
+            # Станцию, заглушённую стримом, unmute возвращает на рабочий
+            # уровень — он и база: и ответ на unmute, и чтение сразу
+            # после прерванного гашения несут прежнюю громкость
+            sent = await self._station_controls.unmute()
+            ctx.reply_volume = (
+                working if sent or current_volume is None else current_volume
+            )
+            if ctx.reply_volume != working:
+                logger.info(
+                    f"🔊 Станция перед репликой на {ctx.reply_volume}, "
+                    f"рабочий уровень {working}"
+                )
+
+    async def _quiet_ruark_for_speech(self) -> None:
+        """Приглушает Ruark на реплику Алисы, если он отвечает.
+
+        Зависший Ruark и так молчит, а реплику слышно только после
+        unmute станции: ошибка колонки не должна его отменять.
+        """
+        try:
             self._remember_ruark_volume_level(
                 await self._ruark_controls.get_volume()
             )
-            ctx.restored_volume = None
             await self._ruark_controls.set_volume(RUARK_IDLE_VOLUME)
+        except RuarkUnavailableError as e:
+            await self._note_ruark_outage(e)
 
-            if current_volume == 0:
-                await self._station_controls.unmute()
+    async def _note_ruark_outage(self, error: Exception) -> None:
+        """Учитывает недоступность Ruark, объявляя только затянувшуюся.
+
+        Args:
+            error (Exception): Ошибка команды, для лога.
+        """
+        now = time.monotonic()
+        if self._ruark_outage_started_at is None:
+            self._ruark_outage_started_at = now
+            self._ruark_outage_announced = False
+            logger.warning(f"⚠️ Ruark не отвечает, цикл ждёт его: {error}")
+            return
+        if (
+            self._ruark_outage_announced
+            or now - self._ruark_outage_started_at < RUARK_OUTAGE_PATIENCE
+        ):
+            return
+        self._ruark_outage_announced = True
+        logger.error(
+            f"❌ Ruark не отвечает дольше "
+            f"{RUARK_OUTAGE_PATIENCE:.0f} с: {error}"
+        )
+        await self._safe_stop_step(self._station_controls.unmute)
+        await self._announce_error(RUARK_SILENT_PHRASE)
+
+    def _clear_ruark_outage(self) -> None:
+        """Отмечает, что Ruark снова отвечает."""
+        if self._ruark_outage_started_at is None:
+            return
+        outage = time.monotonic() - self._ruark_outage_started_at
+        logger.info(f"✅ Ruark снова отвечает, молчал {outage:.0f} с")
+        self._ruark_outage_started_at = None
 
     async def _handle_idle_cycle(
         self, track: Track, ctx: "_CycleContext"
@@ -417,6 +575,7 @@ class MainStreamManager:
         Returns:
             Track: Актуальный трек (мог обновиться при повторном опросе).
         """
+        self._shutdown_if_idle(track, ctx)
         await self._stop_or_recover_paused_track(track, ctx)
         await self._resume_radio_if_silent(track, ctx)
         track = await self._refresh_track_if_unchanged(track, ctx)
@@ -428,6 +587,32 @@ class MainStreamManager:
         await self._fade_alice_if_playing(track, ctx)
         ctx.volume_set_count = 0
         return track
+
+    def _shutdown_if_idle(self, track: Track, ctx: "_CycleContext") -> None:
+        """Выключает стрим, если станция не играет дольше заданного.
+
+        Проверка идёт до команд Ruark: уснувший в штатном автовыключении
+        Ruark не отвечает, и остальные шаги витка прерываются.
+        """
+        if track.playing:
+            ctx.idle_since = None
+            return
+        now = time.monotonic()
+        if ctx.idle_since is None:
+            ctx.idle_since = now
+            return
+        minutes = settings.idle_shutdown_minutes
+        if (
+            not minutes
+            or self._is_shutting_down()
+            or now - ctx.idle_since < minutes * 60
+        ):
+            return
+        logger.info(
+            f"💤 Станция не играет дольше {minutes:g} мин — выключаем "
+            f"стрим, звук возвращается на станцию"
+        )
+        self._schedule_shutdown()
 
     async def _stop_or_recover_paused_track(
         self, track: Track, ctx: "_CycleContext"
@@ -461,7 +646,7 @@ class MainStreamManager:
         свежепривязанному потоку нужно время на буферизацию HLS, иначе
         ежесекундные перепривязки сами не дают радио стартовать.
         """
-        if track.type != "FmRadio":
+        if not track.is_radio:
             return
         if ctx.last_track_progress == track.progress:
             return
@@ -483,7 +668,7 @@ class MainStreamManager:
             return
         ctx.last_stream_sent_at = time.monotonic()
         await self._send_track_to_stream_server(
-            track_url=radio_url,
+            _radio_source(radio_url),
             radio=True,
             title=track.title,
             **(await self._track_meta(track)),
@@ -510,7 +695,7 @@ class MainStreamManager:
         значением с учётом времени, прошедшего со снапшота, — иначе
         долгая итерация (fade, запросы) выглядела бы как скачок.
         """
-        if track.type == "FmRadio" or not track.playing:
+        if track.is_radio or not track.playing:
             return
         if track.id != ctx.last_track.id:
             return
@@ -537,7 +722,7 @@ class MainStreamManager:
         дорогая, поэтому выполняется не чаще SILENCE_CHECK_INTERVAL
         и требует двух подтверждений тишины подряд.
         """
-        if track.type == "FmRadio" or not track.playing or ctx.speak_count:
+        if track.is_radio or not track.playing or ctx.speak_count:
             ctx.silent_checks = 0
             return
 
@@ -626,7 +811,7 @@ class MainStreamManager:
         не должен останавливать стриминг.
         """
         try:
-            return await self._ruark_controls.get_power_status() == "0"
+            return not await self._ruark_controls.is_powered_on()
         except Exception as e:
             logger.debug(f"Не удалось узнать питание Ruark: {e}")
             return False
@@ -687,7 +872,7 @@ class MainStreamManager:
         предыдущий — для возврата назад. Уже закешированные и уже
         загружаемые треки пропускаются.
         """
-        if track.type == "FmRadio":
+        if track.is_radio:
             return
         for neighbor_id in (track.next_id, track.prev_id):
             if not neighbor_id or neighbor_id == track.id:
@@ -729,16 +914,15 @@ class MainStreamManager:
             logger.warning("⚠️ Не удалось получить URL трека для ресинка")
             return
 
-        ctx.track_url = source.url
+        ctx.track_source = source
         ctx.last_track = track
         ctx.last_stream_sent_at = time.monotonic()
         await self._send_track_to_stream_server(
-            source.url,
+            source,
             radio=False,
             start_position=track.progress,
             title=track.title,
             artist=track.artist,
-            codec=source.codec,
             **(await self._track_meta(track)),
         )
         logger.info(
@@ -760,31 +944,24 @@ class MainStreamManager:
         switch_started = time.monotonic()
         self._transition_seq += 1
         tid = f"{track.id}#{self._transition_seq}"
-        codec = "mp3"
-        resolved = False
         hot = self._get_cached_source(track.id) is not None
-        if track.type == "FmRadio":
-            ctx.track_url = await self._station_controls.get_radio_url()
-            logger.info(f"🎵 URL радиостанции: {ctx.track_url}")
+        if track.is_radio:
+            radio_url = await self._station_controls.get_radio_url()
+            logger.info(f"🎵 URL радиостанции: {radio_url}")
+            ctx.track_source = _radio_source(radio_url) if radio_url else None
             meta = await self._track_meta(track)
         else:
             # Ссылка и метаданные параллельно: при холодном кеше
             # переход ждёт самый долгий запрос, а не их сумму
-            source, meta = await asyncio.gather(
+            ctx.track_source, meta = await asyncio.gather(
                 self._resolve_track_source(track.id),
                 self._track_meta(track),
             )
-            ctx.track_url = source.url if source else None
-            codec = source.codec if source else "mp3"
-            resolved = source.resolved if source else False
         resolve_seconds = time.monotonic() - switch_started
 
-        if ctx.track_url:
+        if ctx.track_source:
             start_position = 0.0
-            if (
-                track.type != "FmRadio"
-                and track.progress > PROGRESS_JUMP_THRESHOLD
-            ):
+            if not track.is_radio and track.progress > PROGRESS_JUMP_THRESHOLD:
                 start_position = track.progress
                 logger.info(
                     f"▶️ Трек уже играет на станции, продолжаем "
@@ -793,13 +970,11 @@ class MainStreamManager:
             send_started = time.monotonic()
             ctx.last_stream_sent_at = send_started
             await self._send_track_to_stream_server(
-                ctx.track_url,
-                radio=track.type == "FmRadio",
+                ctx.track_source,
+                radio=track.is_radio,
                 start_position=start_position,
                 title=track.title,
                 artist=track.artist,
-                codec=codec,
-                resolved=resolved,
                 tid=tid,
                 **meta,
             )
@@ -822,18 +997,34 @@ class MainStreamManager:
         self, track: Track, ctx: "_CycleContext"
     ) -> None:
         """Возвращает громкость Ruark после речи Алисы."""
+        check = _VoiceVolumeCheck.SKIP
+        base = ctx.reply_volume
+        # Голосовая громкость разбирается один раз, в проходе сразу после
+        # реплики: на паузе гашение ждёт продолжения, а громкость станции
+        # к нему могли поменять уже не голосом
+        if (
+            base is not None
+            and ctx.speak_count > 0
+            and ctx.restored_volume is None
+            and settings.voice_volume_to_ruark
+        ):
+            check = await self._move_voice_volume_to_ruark(base)
+
         if ctx.speak_count > 0 and track.playing:
             logger.info("🔁 Возвращаем громкость Ruark")
             await self._restore_ruark_volume(ctx)
 
             # Радио буферизует HLS дольше, чем стартует трек, —
             # ждём дольше, чтобы не перепривязывать поток зря
-            attempts = 80 if track.type == "FmRadio" else 30
+            attempts = 80 if track.is_radio else 30
             for _ in range(attempts):
                 if await self._ruark_controls.is_playing():
                     logger.info("▶️ Ruark начал играть")
-                    await self._station_controls.fade_out_alice_volume()
-                    ctx.speak_count = 0
+                    break
+                # Новая реплика не ждёт Ruark: гашение уступит ей станцию,
+                # а поток проверит следующий возврат громкости
+                if await self._station_controls.is_alice_active():
+                    logger.info("🎙 Алиса снова активна — Ruark не ждём")
                     break
                 await asyncio.sleep(0.1)
             else:
@@ -841,15 +1032,15 @@ class MainStreamManager:
                     "⚠️ Ruark так и не начал играть, "
                     "перезапуск трека на стрим сервере"
                 )
-                if ctx.track_url:
+                if ctx.track_source:
                     # Для трека продолжаем с текущей позиции станции,
                     # а не с начала — иначе рассинхрон
                     ctx.last_stream_sent_at = time.monotonic()
                     await self._send_track_to_stream_server(
-                        ctx.track_url,
-                        radio=track.type == "FmRadio",
+                        ctx.track_source,
+                        radio=track.is_radio,
                         start_position=(
-                            track.progress if track.type != "FmRadio" else 0.0
+                            0.0 if track.is_radio else track.progress
                         ),
                         title=track.title,
                         artist=track.artist,
@@ -859,11 +1050,106 @@ class MainStreamManager:
                     logger.warning(
                         "⚠️ Нет сохранённого URL трека для перезапуска"
                     )
-                await self._station_controls.fade_out_alice_volume()
-                ctx.speak_count = 0
+            await self._fade_station_after_reply(ctx, check)
+            ctx.speak_count = 0
 
         if ctx.speak_count > 0 and not track.playing:
             await self._restore_ruark_volume(ctx)
+
+    def _voice_ruark_volume(
+        self, current: float | None, base: float
+    ) -> int | None:
+        """Громкость Ruark со сдвигом станции за реплику Алисы.
+
+        Подъём станции с нуля не переносится.
+
+        Args:
+            current (float | None): Прочитанная громкость станции.
+            base (float): Громкость станции перед репликой.
+        Returns:
+            int | None: Новая громкость Ruark или None без команды.
+        """
+        if current is None:
+            return None
+        steps = round((current - base) / STATION_VOLUME_STEP)
+        if steps == 0:
+            return None
+        # Ноль перед репликой: unmute вернул тишину или станцию опустили
+        # кнопкой, и подъём — это слушатель возвращает голос Алисе,
+        # а не «громче»
+        if base <= 0:
+            logger.info(
+                f"🔇 Станция перед репликой на нуле — подъём до "
+                f"{current} не переносится на Ruark"
+            )
+            return None
+
+        # «Тише» не опускает Ruark ниже границы, но и не поднимает его,
+        # если ручкой он выкручен ещё тише
+        lowest = min(RUARK_MIN_VOICE_VOLUME, self._ruark_volume)
+        volume = min(
+            max(
+                self._ruark_volume + steps * RUARK_VOLUME_PER_STATION_STEP,
+                lowest,
+            ),
+            RUARK_MAX_VOLUME,
+        )
+        logger.info(
+            f"🔊 Голосовая громкость: станция {base} ➝ {current} "
+            f"(шагов: {steps}), Ruark {self._ruark_volume} ➝ {volume}"
+        )
+        return volume
+
+    async def _move_voice_volume_to_ruark(
+        self, base: float
+    ) -> _VoiceVolumeCheck:
+        """Переносит на Ruark сдвиг станции в первой IDLE-итерации.
+
+        Args:
+            base (float): Громкость станции перед репликой.
+        Returns:
+            _VoiceVolumeCheck: MOVED, если сдвиг перенесён, иначе LATE.
+        """
+        current = await self._station_controls.get_volume()
+        # Ноль сразу после unmute бывает ответом станции с прежней
+        # громкостью, а не командой: решит гашение по свежему чтению
+        if current == 0 and self._station_controls.level_unconfirmed:
+            return _VoiceVolumeCheck.LATE
+        volume = self._voice_ruark_volume(current, base)
+        if volume is None:
+            return _VoiceVolumeCheck.LATE
+        self._ruark_volume = volume
+        # Сразу, без плавного снижения: иначе гашение после реплики
+        # приняло бы сдвиг за новый рабочий уровень станции
+        await self._station_controls.set_volume(base)
+        return _VoiceVolumeCheck.MOVED
+
+    async def _fade_station_after_reply(
+        self, ctx: "_CycleContext", check: _VoiceVolumeCheck
+    ) -> None:
+        """Гасит станцию после реплики и разбирает сдвиг перед гашением.
+
+        Args:
+            ctx (_CycleContext): Состояние цикла с громкостью перед репликой.
+            check (_VoiceVolumeCheck): Что делать с голосовой громкостью.
+        """
+        start = await self._station_controls.fade_out_alice_volume()
+        base = ctx.reply_volume
+        if check is _VoiceVolumeCheck.SKIP or base is None:
+            return
+        if check is _VoiceVolumeCheck.MOVED:
+            # Гашение могло прочитать перенесённый сдвиг раньше, чем
+            # станция сообщила возврат на прежний уровень
+            self._station_controls.working_volume = base
+            return
+        # Станция может сообщить сдвиг позже первой проверки
+        volume = self._voice_ruark_volume(start, base)
+        if volume is None:
+            return
+        # Гашение приняло сдвиг за рабочий уровень — возвращаем прежний
+        self._station_controls.working_volume = base
+        self._ruark_volume = volume
+        await self._restore_ruark_volume(ctx)
 
     async def _restore_ruark_volume(self, ctx: "_CycleContext") -> None:
         """Возвращает Ruark запомненную громкость не более одного раза.
@@ -896,9 +1182,9 @@ class MainStreamManager:
                     current_volume is not None
                     and current_volume > 0
                     and track.duration - track.progress > 10
-                    and track.type != "FmRadio"
+                    and not track.is_radio
                 )
-                or (track.type == "FmRadio" and track.playing)
+                or (track.is_radio and track.playing)
             )
             and track.playing
         ):
@@ -925,27 +1211,34 @@ class MainStreamManager:
         return False
 
     async def _unmute_before_track_end(
-        self, track: Track, alice_state: str | None
+        self, track: Track, alice_state: AliceState | None
     ) -> None:
         """Возвращает громкость станции перед самым концом трека."""
         if (
             track.duration - track.progress < 1
-            and alice_state == "IDLE"
+            and alice_state == AliceState.IDLE
             and track.playing
-            and track.type != "FmRadio"
+            and not track.is_radio
         ):
             await self._station_controls.unmute()
 
-    async def _wrap_streaming(self):
+    async def _wrap_streaming(self) -> None:
         """Следит за потоком стриминга и перезапускает его при падении.
 
-        Серия быстрых падений подряд означает, что сам перезапуск
-        не помогает (например, умер DLNA-сервер) — один раз
-        озвучивается ошибка, чтобы тишина не осталась без объяснения.
+        Пауза перед перезапуском растёт до потолка, пока цикл падает
+        вскоре после старта. Серия быстрых падений подряд означает,
+        что сам перезапуск не помогает (например, умер DLNA-сервер) —
+        один раз озвучивается ошибка, чтобы тишина не осталась без
+        объяснения.
         """
         failure_streak = 0
-        last_failure_at = 0.0
+        backoff = ExponentialBackoff(
+            STREAMING_RESTART_DELAY, STREAMING_RESTART_MAX_DELAY
+        )
         while self._stream_state_running:
+            # Серию рвёт только работа цикла без падения: растущая
+            # пауза перед перезапуском в этот срок не входит
+            started_at = time.monotonic()
             try:
                 logger.info("🚀 Запуск потока стриминга")
                 await self.streaming()
@@ -955,20 +1248,18 @@ class MainStreamManager:
             except Exception as e:
                 logger.error(f"❌ Поток стриминга упал с ошибкой: {e}")
                 now = time.monotonic()
-                if now - last_failure_at > STREAMING_FAILURE_STREAK_RESET:
+                if now - started_at > STREAMING_FAILURE_STREAK_RESET:
                     failure_streak = 0
-                last_failure_at = now
+                    backoff.reset()
                 failure_streak += 1
                 if failure_streak == STREAMING_FAILURE_ANNOUNCE_AFTER:
                     # Станция замьючена стримом — вернуть звук,
                     # иначе объявление не услышать
                     await self._safe_stop_step(self._station_controls.unmute)
                     await self._announce_error(STREAM_BROKEN_PHRASE)
-                logger.info(
-                    f"🔁 Перезапуск стриминга через "
-                    f"{STREAMING_RESTART_DELAY} секунд..."
-                )
-                await asyncio.sleep(STREAMING_RESTART_DELAY)
+                delay = backoff.next_delay()
+                logger.info(f"🔁 Перезапуск стриминга через {delay} секунд...")
+                await asyncio.sleep(delay)
                 logger.debug("🔄 Перезапуск потока после падения")
 
     async def _announce_error(self, phrase: str) -> None:
@@ -992,7 +1283,7 @@ class MainStreamManager:
         if volume > RUARK_IDLE_VOLUME:
             self._ruark_volume = volume
 
-    async def _remember_ruark_volume(self):
+    async def _remember_ruark_volume(self) -> None:
         """Запоминает пользовательскую громкость Ruark для нового сеанса."""
         try:
             self._remember_ruark_volume_level(
@@ -1031,20 +1322,75 @@ class MainStreamManager:
         self._ruark_volume = applied
         logger.info(f"🔊 Стартовая громкость стрима: {applied}")
 
-    async def _prepare_devices(self):
+    async def _prepare_devices_patiently(self) -> None:
+        """Готовит устройства, дожидаясь Ruark без падения цикла.
+
+        Пока Ruark завис или перезагружается, звук остаётся на станции;
+        уровень громкости выбирается, когда колонка снова отвечает.
+        """
+        while self._stream_state_running:
+            try:
+                await self._prepare_devices()
+                self._clear_ruark_outage()
+                return
+            except (RuarkApiError, RuarkUnavailableError) as e:
+                await self._note_ruark_outage(e)
+                await asyncio.sleep(RUARK_RETRY_INTERVAL)
+
+    async def _prepare_devices(self) -> None:
+        """Готовит станцию и Ruark к стримингу: громкость и питание."""
         logger.info("🔧 Подготовка устройств к стримингу...")
         # Ждём первое сообщение станции вместо фиксированной паузы:
         # обычно оно приходит сразу после подключения WebSocket
         await self._ws_client.wait_for_state_update(1.0)
         await self._station_controls.set_default_volume()
         await self._ruark_controls.get_session_id()
-        if await self._ruark_controls.get_power_status() == "0":
+        powered_on = await self._ruark_controls.is_powered_on()
+        if not powered_on:
             await self._ruark_controls.turn_power_on()
-
         if settings.start_volume is not None:
             await self._apply_start_volume(settings.start_volume)
             return
+        if not powered_on:
+            await self._restore_saved_ruark_volume()
+        else:
+            await self._resolve_running_ruark_volume()
 
+        if self._ruark_volume <= RUARK_IDLE_VOLUME:
+            # Ни снапшота, ни звука на колонке — поднимаем до слышимого
+            # минимума, иначе стрим стартует в полной тишине
+            self._ruark_volume = RUARK_MIN_START_VOLUME
+            await self._ruark_controls.set_volume(RUARK_MIN_START_VOLUME)
+            logger.info(
+                f"🔊 Ruark стоял на тишине — стартовая громкость "
+                f"поднята до {RUARK_MIN_START_VOLUME}"
+            )
+
+    async def _resolve_running_ruark_volume(self) -> None:
+        """Выбирает уровень включённого Ruark: устройство, память, файл."""
+        volume = await self._ruark_controls.get_volume()
+        if volume > RUARK_IDLE_VOLUME:
+            # Перезапуск API и падение цикла колонку не трогают: на ней
+            # настоящий уровень, чем бы его ни меняли
+            self._ruark_volume = volume
+            logger.info(
+                f"🔊 Ruark уже включён, громкость взята с устройства: "
+                f"{volume}"
+            )
+        elif self._ruark_volume > RUARK_IDLE_VOLUME:
+            # Цикл упал во время реплики: Ruark приглушён, а в памяти
+            # уровень до приглушения с голосовыми правками, он свежее файла
+            await self._ruark_controls.set_volume(self._ruark_volume)
+            logger.info(
+                f"🔊 Ruark приглушён прерванной репликой, громкость "
+                f"возвращена из памяти: {self._ruark_volume}"
+            )
+        else:
+            # Процесс перезапущен во время реплики: память пуста
+            await self._restore_saved_ruark_volume()
+
+    async def _restore_saved_ruark_volume(self) -> None:
+        """Ставит на Ruark громкость из файла, без неё читает устройство."""
         saved_volume = self._volume_store.load()
         if saved_volume is not None and saved_volume > RUARK_IDLE_VOLUME:
             # Восстанавливаем громкость прошлого сеанса
@@ -1103,7 +1449,7 @@ class MainStreamManager:
         из API Музыки (кешируется по id). Ошибки не мешают стриму.
         """
         album, cover = "", track.cover
-        if track.type != "FmRadio" and track.id and track.id != "0":
+        if not track.is_radio and track.id and track.id != "0":
             info = await self._track_info(track.id)
             album = info.album
             cover = cover or info.cover
@@ -1121,7 +1467,7 @@ class MainStreamManager:
         if not self._stream_state_running or track is None:
             return None
         next_id = track.next_id
-        if not next_id or track.type == "FmRadio":
+        if not next_id or track.is_radio:
             return None
         try:
             info = await asyncio.wait_for(
@@ -1140,48 +1486,46 @@ class MainStreamManager:
 
     async def _send_track_to_stream_server(
         self,
-        track_url: str,
+        source: TrackSource,
         radio: bool = False,
         start_position: float = 0.0,
         title: str = "",
         artist: str = "",
-        codec: str = "mp3",
         album: str = "",
         cover: str = "",
-        resolved: bool = False,
         tid: str = "",
-    ):
+    ) -> JsonValue:
         """Отправляет ссылку на трек на стрим сервер.
 
         Args:
-            track_url (str): Прямая ссылка на источник потока.
+            source (TrackSource): Ссылка на источник потока и его кодек.
             radio (bool): Режим радио.
             start_position (float): Позиция старта в секундах.
             title (str): Название трека для дисплея Ruark.
             artist (str): Исполнитель для дисплея Ruark.
-            codec (str): Кодек источника: mp3 или flac.
             album (str): Альбом для дисплеев колонок.
             cover (str): Ссылка на обложку.
-            resolved (bool): Ссылка уже конечная, без перенаправлений.
             tid (str): Номер перехода для склейки журналов.
         """
         try:
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                logger.info(f"🎵 Отправляем трек на стрим сервер: {track_url}")
+                logger.info(
+                    f"🎵 Отправляем трек на стрим сервер: {source.url}"
+                )
                 async with session.post(
                     f"http://{self._stream_server_url}:"
                     f"{settings.local_server_port_dlna}/set_stream",
                     params={
-                        "yandex_url": track_url,
+                        "yandex_url": source.url,
                         "radio": str(radio).lower(),
                         "start_position": f"{start_position:.1f}",
                         "title": title,
                         "artist": artist,
-                        "codec": codec,
+                        "codec": source.codec,
                         "album": album,
                         "cover": cover,
-                        "resolved": str(resolved).lower(),
+                        "resolved": str(source.resolved).lower(),
                         "tid": tid,
                     },
                 ) as resp:
@@ -1195,7 +1539,7 @@ class MainStreamManager:
             logger.error(f"❌ Непредвиденная ошибка при отправке трека: {e}")
             return None
 
-    async def _stop_stream_on_stream_server(self):
+    async def _stop_stream_on_stream_server(self) -> JsonValue:
         """Останавливает стрим на стрим сервере."""
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1235,9 +1579,9 @@ class MainStreamManager:
     def _log_current_track(
         self,
         track: Track,
-        state: str | None,
+        state: AliceState | None,
         ctx: "_CycleContext",
-    ):
+    ) -> None:
         """Логирует состояние: INFO при изменении, DEBUG на каждом тике."""
         message = (
             f"🎵 Сейчас играет: {track.id} - {track.artist} - "

@@ -5,6 +5,24 @@ import pytest
 from yandex_station.station_ws_control import YandexStationClient
 
 
+@pytest.fixture(autouse=True)
+def station_volume_file(tmp_path, monkeypatch):
+    """Файл рабочего уровня станции: тесты не трогают настоящий cache/."""
+    path = tmp_path / "station_volume.txt"
+    monkeypatch.setattr("yandex_station.volume_store.DEFAULT_STORE_PATH", path)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def ruark_volume_file(tmp_path, monkeypatch):
+    """Файл громкости Ruark: тесты не трогают настоящий cache/."""
+    path = tmp_path / "ruark_volume.txt"
+    monkeypatch.setattr(
+        "ruark_audio_system.volume_store.DEFAULT_STORE_PATH", path
+    )
+    return path
+
+
 @pytest.fixture
 def mock_finder():
     """Мок DeviceFinder с найденной станцией."""

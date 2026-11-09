@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,10 +23,12 @@ class Settings(BaseSettings):
         env_file=resolve_env_path(),
         env_prefix="APP_",
         extra="ignore",
+        # Текст ошибки валидации не должен показывать токен и PIN из ввода
+        hide_input_in_errors=True,
     )
 
     # Yandex Music settings
-    ya_music_token: str
+    ya_music_token: SecretStr
 
     # API server settings
     local_server_host: str
@@ -36,7 +39,8 @@ class Settings(BaseSettings):
     output_backend: Literal["ruark", "owntone"] = "ruark"
 
     # Ruark R5 settings
-    ruark_pin: str = "1234"
+    # Нужен только выводу на Ruark; для OwnTone — заглушка
+    ruark_pin: SecretStr = SecretStr("1234")
     # Известный IP Ruark: быстрый старт без SSDP-скана всей сети
     ruark_host: str | None = None
 
@@ -79,6 +83,10 @@ class Settings(BaseSettings):
     stream_is_local_file: bool = False
     # Предпочитать lossless (FLAC), когда он доступен для трека
     prefer_lossless: bool = True
+    # «Алиса, громче» и «тише» во время стрима меняют громкость Ruark
+    voice_volume_to_ruark: bool = True
+    # Пауза дольше стольких минут выключает стрим, 0 — никогда
+    idle_shutdown_minutes: float = 60.0
 
 
 settings = Settings()

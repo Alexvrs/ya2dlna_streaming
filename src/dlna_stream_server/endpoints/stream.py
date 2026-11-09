@@ -1,9 +1,11 @@
 import asyncio
 import time
+from itertools import count
 from logging import getLogger
 
 from fastapi import APIRouter, Request, Response
 
+from core.enums import Codec
 from dlna_stream_server.handlers.stream_handler import StreamHandler
 from dlna_stream_server.handlers.utils import ruark_r5_request_logger
 
@@ -14,6 +16,9 @@ router = APIRouter()
 
 # Словарь для отслеживания активных задач
 _active_tasks: dict[str, asyncio.Task[None]] = {}
+# Номера задач не повторяются: иначе finally отменённой задачи удалил бы
+# запись новой с тем же id, и следующий запрос её не отменил бы
+_task_numbers = count()
 
 
 def _get_stream_handler(request: Request) -> StreamHandler:
@@ -24,26 +29,26 @@ def _get_stream_handler(request: Request) -> StreamHandler:
 async def _handle_stream_task(
     stream_handler: StreamHandler,
     yandex_url: str,
+    codec: Codec,
     task_id: str,
     radio: bool = False,
     start_position: float = 0.0,
     title: str = "",
     artist: str = "",
-    codec: str = "mp3",
     album: str = "",
     cover: str = "",
     resolved: bool = False,
     tid: str = "",
-):
+) -> None:
     """Обработчик задачи потока с логированием ошибок."""
     try:
         await stream_handler.play_stream(
             yandex_url,
+            codec,
             radio,
             start_position,
             title,
             artist,
-            codec,
             album=album,
             cover=cover,
             resolved=resolved,
@@ -61,19 +66,20 @@ async def _handle_stream_task(
 async def set_stream(
     request: Request,
     yandex_url: str,
+    codec: Codec,
     radio: bool = False,
     start_position: float = 0.0,
     title: str = "",
     artist: str = "",
-    codec: str = "mp3",
     album: str = "",
     cover: str = "",
     resolved: bool = False,
     tid: str = "",
-):
+) -> dict[str, str]:
     """Принимает URL трека и запускает потоковую передачу на Ruark.
 
-    start_position — позиция старта в секундах для ресинка (повтор,
+    codec обязателен: неизвестный или пропущенный FastAPI отвергает
+    с 422. start_position — позиция старта в секундах для ресинка (повтор,
     перемотка, продолжение после паузы); title и artist показываются
     на дисплее Ruark. resolved — ссылка уже конечная (без 308),
     tid — номер перехода для склейки журналов.
@@ -83,8 +89,7 @@ async def set_stream(
         f"(позиция: {start_position:.1f}s, t={time.monotonic():.3f})"
     )
 
-    # Генерируем уникальный ID для задачи
-    task_id = f"stream_{len(_active_tasks)}"
+    task_id = f"stream_{next(_task_numbers)}"
 
     # Отменяем предыдущие активные задачи
     for old_task_id, old_task in list(_active_tasks.items()):
@@ -98,12 +103,12 @@ async def set_stream(
         _handle_stream_task(
             _get_stream_handler(request),
             yandex_url,
+            codec,
             task_id,
             radio,
             start_position,
             title,
             artist,
-            codec,
             album,
             cover,
             resolved,
@@ -120,7 +125,7 @@ async def set_stream(
 
 
 @router.get("/live_stream.mp3")
-async def serve_stream(request: Request, radio: bool = False):
+async def serve_stream(request: Request, radio: bool = False) -> Response:
     """Раздает потоковый аудиофайл через HTTP."""
     await ruark_r5_request_logger(request)
     return await _get_stream_handler(request).stream_audio(
@@ -129,7 +134,7 @@ async def serve_stream(request: Request, radio: bool = False):
 
 
 @router.head("/live_stream.mp3")
-async def serve_head(request: Request, radio: bool = False):
+async def serve_head(request: Request, radio: bool = False) -> Response:
     """Обрабатывает HEAD-запрос для Ruark R5 с корректными заголовками."""
     headers = {
         "Content-Type": _get_stream_handler(request).stream_media_type,
@@ -140,7 +145,7 @@ async def serve_head(request: Request, radio: bool = False):
 
 
 @router.post("/stop_stream")
-async def stop_stream(request: Request):
+async def stop_stream(request: Request) -> dict[str, str]:
     """Останавливает потоковую передачу на Ruark."""
     logger.info("🛑 Остановка потоковой передачи...")
     await _get_stream_handler(request).stop_ffmpeg()

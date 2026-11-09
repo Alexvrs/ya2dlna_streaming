@@ -12,10 +12,16 @@ import aiohttp
 from injector import inject
 
 from core.authorization.yandex_tokens import get_device_token
+from core.backoff import ExponentialBackoff
 from core.config.settings import settings
-from yandex_station.constants import SOCKET_RECONNECT_DELAY
+from yandex_station.constants import (
+    SOCKET_RECONNECT_DELAY,
+    SOCKET_RECONNECT_MAX_DELAY,
+    STATION_CONNECT_TIMEOUT,
+)
 from yandex_station.exceptions import (
     ClientNotRunningError,
+    StationAuthError,
     StationNotFoundError,
 )
 from yandex_station.mdns_device_finder import DeviceFinder, StationDevice
@@ -71,6 +77,8 @@ class YandexStationClient:
         self.authenticated = False
         self.running = True
         self.reconnect_required = False
+        # Станция играла до обрыва: после переподключения вернуть игру
+        self._resume_playback = False
         # Сигнал о новом сообщении станции для событийного цикла
         self.state_updated = asyncio.Event()
         self._connect_task: asyncio.Task[None] | None = None
@@ -149,7 +157,7 @@ class YandexStationClient:
         except (OSError, asyncio.TimeoutError):
             return False
 
-    async def run_once(self):
+    async def run_once(self) -> None:
         """Гарантированный однократный запуск WebSocket."""
         if self._connect_task and not self._connect_task.done():
             logger.warning("⚠️ WebSocket уже запущен")
@@ -160,24 +168,31 @@ class YandexStationClient:
         self._connect_task = asyncio.create_task(self.connect())
         self._check_duplicate_tasks()
 
-    async def connect(self):
+    async def connect(self) -> None:
         """Подключение к WebSocket станции."""
         device_id, platform, uri = self._require_station_params()
 
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
+        backoff = ExponentialBackoff(
+            SOCKET_RECONNECT_DELAY, SOCKET_RECONNECT_MAX_DELAY
+        )
+        # total — стандарт aiohttp: обрывает попытку, если станция приняла
+        # соединение, но молчит на рукопожатии WebSocket. Живое соединение
+        # он не обрывает: таймер прерывает только ожидание рукопожатия
+        timeout = aiohttp.ClientTimeout(
+            total=300, sock_connect=STATION_CONNECT_TIMEOUT
+        )
 
         try:
             while True:
-                # Сохраняем флаг для отправки команд после переподключения
-                need_restart_playback = self.reconnect_required
                 self.reconnect_required = False
-
                 self.running = True
 
                 try:
                     if not self.device_token:
+                        logger.info("🔄 Запрос нового токена...")
                         self.device_token = await get_device_token(
                             device_id, platform
                         )
@@ -201,7 +216,9 @@ class YandexStationClient:
                         await self.session.close()
                         self.session = None
 
-                    async with aiohttp.ClientSession() as session:
+                    async with aiohttp.ClientSession(
+                        timeout=timeout
+                    ) as session:
                         self.session = session
                         logger.info(f"🔄 Подключение к станции: {uri}")
                         self.websocket = await session.ws_connect(
@@ -234,17 +251,19 @@ class YandexStationClient:
                             cleanup_task,
                         ]
 
-                        auth_success = await self.authenticate()
-                        if not auth_success:
-                            logger.warning(
-                                "❌ Ошибка авторизации! Требуется новый токен."
+                        if not await self.authenticate():
+                            # Новый токен запросится в начале следующей
+                            # попытки — уже после паузы
+                            self.device_token = None
+                            raise StationAuthError(
+                                f"Ошибка авторизации на {uri}! "
+                                f"Требуется новый токен."
                             )
-                            await self.refresh_token()
-                            continue  # Попробуем снова
+                        backoff.reset()
 
                         # Отправляем команды восстановления только после
                         # успешной авторизации
-                        if need_restart_playback:
+                        if self._resume_playback:
                             logger.info(
                                 "🔄 Восстанавливаем воспроизведение после "
                                 "переподключения"
@@ -259,6 +278,7 @@ class YandexStationClient:
                                     f"❌ Ошибка при восстановлении "
                                     f"воспроизведения: {e}"
                                 )
+                            self._resume_playback = False
 
                         results = await asyncio.gather(
                             *self.tasks, return_exceptions=True
@@ -269,6 +289,16 @@ class YandexStationClient:
                                     f"Задача {i} завершилась "
                                     f"с ошибкой: {result}"
                                 )
+
+                        # Сеанс оборвался, а сообщений нового ещё нет:
+                        # последнее в очереди — от оборванного сеанса
+                        self._resume_playback = (
+                            self.reconnect_required
+                            and self._station_was_playing()
+                        )
+
+                except StationAuthError as e:
+                    logger.warning(f"❌ {e}")
 
                 except aiohttp.ClientError as e:
                     logger.error(f"❌ WebSocket ошибка: {e}")
@@ -288,17 +318,15 @@ class YandexStationClient:
                     )
                     break
 
-                logger.info(
-                    f"🔄 Переподключение через "
-                    f"{SOCKET_RECONNECT_DELAY} секунд..."
-                )
-                await asyncio.sleep(SOCKET_RECONNECT_DELAY)
+                delay = backoff.next_delay()
+                logger.info(f"🔄 Переподключение через {delay} секунд...")
+                await asyncio.sleep(delay)
 
         except asyncio.CancelledError:
             logger.info("🛑 connect() прерван через CancelledError")
             raise
 
-    async def keep_alive_ws_connection(self):
+    async def keep_alive_ws_connection(self) -> None:
         """Поддерживает WebSocket-соединение активным."""
         try:
             while self.running:
@@ -316,7 +344,7 @@ class YandexStationClient:
 
                     if self.websocket and not self.websocket.closed:
                         await self.websocket.ping()
-                        logger.info(
+                        logger.debug(
                             "📡 Отправлен ping-frame через aiohttp.WebSocket"
                         )
 
@@ -389,15 +417,7 @@ class YandexStationClient:
             logger.error(f"❌ Ошибка при проверке авторизации: {e}")
             return False
 
-    async def refresh_token(self):
-        """Запрашивает новый токен и перезапускает WebSocket."""
-        logger.info("🔄 Запрос нового токена...")
-        device_id, platform, _ = self._require_station_params()
-        self.device_token = await get_device_token(device_id, platform)
-        logger.info("✅ Новый токен получен. Переподключение...")
-        await asyncio.sleep(1)
-
-    async def stream_station_messages(self):
+    async def stream_station_messages(self) -> None:
         """Постоянный поток сообщений от станции с защитой от зависания."""
         logger.info("📥 Поток приёма сообщений от станции запущен")
 
@@ -492,7 +512,7 @@ class YandexStationClient:
         await self.command_queue.put("stop")
         logger.info("🛑 stream_station_messages завершен")
 
-    async def command_producer_handler(self):
+    async def command_producer_handler(self) -> None:
         """Обрабатывает команды из очереди и отправляет их на станцию."""
         logger.info("📤 Поток отправки команд на станцию запущен")
         while self.running:
@@ -504,7 +524,8 @@ class YandexStationClient:
                 logger.debug("⏱ Очередь пуста, ждём новые команды...")
                 continue
 
-            if command == "stop":
+            # Строка в очереди бывает одна — сигнал остановки "stop"
+            if isinstance(command, str):
                 break
 
             #  Блокировка гарантирует,
@@ -518,7 +539,10 @@ class YandexStationClient:
                     await asyncio.wait_for(
                         self.websocket.send_json(command), timeout=5
                     )
-                    logger.info(f"✅ Команда отправлена на станцию: {command}")
+                    logger.debug(
+                        f"✅ Команда {command['id']} отправлена на станцию: "
+                        f"{command['payload']}"
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "⚠️ Таймаут при отправке команды через WebSocket"
@@ -552,11 +576,11 @@ class YandexStationClient:
         }
 
         await self.command_queue.put(command_payload)
-        logger.info(f"✅ Команда {request_id} добавлена в очередь")
+        logger.debug(f"✅ Команда {request_id} добавлена в очередь")
 
         try:
             response = await asyncio.wait_for(future, timeout=10)
-            logger.info(f"✅ Ответ на команду {request_id} получен")
+            logger.debug(f"✅ Ответ на команду {request_id} получен")
             return response
         except asyncio.TimeoutError:
             logger.error(
@@ -566,10 +590,15 @@ class YandexStationClient:
         finally:
             self.waiters.pop(request_id, None)  # Чистим Future после обработки
 
-    async def get_latest_message(self):
+    async def get_latest_message(self) -> dict[str, Any] | None:
         """Возвращает последнее сообщение из очереди или None, если пуста."""
         latest = self.queue[-1] if self.queue else None
         return latest
+
+    def _station_was_playing(self) -> bool:
+        """Сообщает, играла ли станция по последнему сообщению очереди."""
+        latest = self.queue[-1] if self.queue else {}
+        return bool(latest.get("state", {}).get("playing", False))
 
     async def wait_for_state_update(self, timeout: float) -> bool:
         """Ждёт нового сообщения станции, но не дольше timeout секунд.
@@ -595,7 +624,7 @@ class YandexStationClient:
         self.state_updated.clear()
         return True
 
-    async def _cancel_tasks(self):
+    async def _cancel_tasks(self) -> None:
         """Отмена всех активных задач, чтобы избежать зависших WebSocket."""
 
         if not self.tasks:
@@ -613,7 +642,7 @@ class YandexStationClient:
         self.tasks.clear()
         logger.info("✅ Все фоновые задачи успешно отменены")
 
-    async def close(self):
+    async def close(self) -> None:
         """Закрытие WebSocket-соединения и фоновых задач."""
         self.running = False
 
@@ -669,7 +698,12 @@ class YandexStationClient:
             self._connect_task = None
             logger.info("✅ Задача подключения к станции отменена")
 
-    def _log_software_version(self, software_version: str):
+        # Иначе новый сеанс в этом процессе прочитает состояние прошлого
+        self.queue.clear()
+        self.state_updated.clear()
+        self._resume_playback = False
+
+    def _log_software_version(self, software_version: str) -> None:
         """Логирует версию ПО станции в файл, если она изменилась."""
         try:
             version_log_file_path = os.path.abspath(
@@ -704,7 +738,7 @@ class YandexStationClient:
         except Exception as e:
             logger.error(f"❌ Ошибка при записи версии ПО в лог: {e}")
 
-    def _fail_all_pending_futures(self, error: Exception):
+    def _fail_all_pending_futures(self, error: Exception) -> None:
         """Завершает все зависшие Future."""
         count = 0
         for request_id, (future, _) in list(self.waiters.items()):
@@ -717,7 +751,7 @@ class YandexStationClient:
                 f"❌ Завершено {count} зависших Future с ошибкой: {error}"
             )
 
-    def _check_duplicate_tasks(self):
+    def _check_duplicate_tasks(self) -> None:
         """Проверка на повторяющиеся задачи."""
         names = [
             getattr(t.get_coro(), "__name__", "unknown")

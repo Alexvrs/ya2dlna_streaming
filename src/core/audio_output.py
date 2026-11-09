@@ -53,8 +53,8 @@ class AudioOutput(Protocol):
         """Открывает сессию управления (если устройству она нужна)."""
         ...
 
-    async def get_power_status(self) -> str:
-        """Питание: "1" — включено, "0" — выключено."""
+    async def is_powered_on(self) -> bool:
+        """Включено ли устройство."""
         ...
 
     async def turn_power_on(self) -> bool:
@@ -63,4 +63,8 @@ class AudioOutput(Protocol):
 
     async def turn_power_off(self) -> bool:
         """Выключает устройство."""
+        ...
+
+    async def set_mode(self, mode_id: str) -> bool:
+        """Переключает режим источника (Ruark: режим покоя при остановке)."""
         ...

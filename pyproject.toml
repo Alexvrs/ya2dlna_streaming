@@ -23,6 +23,7 @@ dev = [
     "flake8-bugbear",
     "flake8-docstrings",
     "flake8-isort",
+    "httpx==0.28.1",
     "isort",
     "mypy",
     "pytest==8.3.5",
@@ -89,6 +90,8 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
 disallow_any_generics = true
 
 [[tool.mypy.overrides]]

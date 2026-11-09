@@ -10,7 +10,10 @@ import upnpclient.soap
 
 from core.config.settings import settings
 from ruark_audio_system.constants import DEFAULT_STREAM_TITLE, META_INFO
-from ruark_audio_system.exceptions import RuarkDeviceNotFoundError
+from ruark_audio_system.exceptions import (
+    RuarkDeviceNotFoundError,
+    RuarkUnavailableError,
+)
 from ruark_audio_system.fsapi_client import RuarkFsApiClient
 from ruark_audio_system.location_store import RuarkLocationStore
 from ruark_audio_system.ssdp import ssdp_locate
@@ -42,7 +45,9 @@ class RuarkR5Controller:
         self._av_transport: Any = None
         self._connection_manager: Any = None
         self._rendering_control: Any = None
-        self._fsapi = RuarkFsApiClient(pin=settings.ruark_pin)
+        self._fsapi = RuarkFsApiClient(
+            pin=settings.ruark_pin.get_secret_value()
+        )
         self._location_store = RuarkLocationStore()
 
     @property
@@ -76,6 +81,21 @@ class RuarkR5Controller:
                 f"сервис {name} недоступен, вызовите connect()"
             )
         return service
+
+    async def _call_upnp(self, action: Any, **kwargs: Any) -> Any:
+        """Выполняет UPnP-команду, переводя сетевой сбой в своё исключение.
+
+        Raises:
+            RuarkUnavailableError: Если Ruark завис или недоступен в сети.
+        """
+        try:
+            return await asyncio.to_thread(action, **kwargs)
+        except OSError as e:
+            # Ошибки requests, на котором работает upnpclient, наследуют
+            # OSError; отказ самого устройства (SOAPError) проходит насквозь
+            raise RuarkUnavailableError(
+                f"Ruark не ответил на {action.name}: {e}"
+            ) from e
 
     async def connect(self, attempts: int = 3, delay: float = 2.0) -> bool:
         """Ищет устройство в сети с несколькими попытками.
@@ -262,14 +282,16 @@ class RuarkR5Controller:
             return parsed_url.hostname
         return None
 
-    def print_available_services(self):
+    def print_available_services(self) -> None:
         """Выводит список всех поддерживаемых сервисов."""
         logger.info("\n📡 Доступные UPnP сервисы:")
         for service in self.services:
             logger.info(f" - {service}")
 
     #  ConnectionManager
-    async def get_protocol_info(self, connection_manager) -> Dict[str, str]:
+    async def get_protocol_info(
+        self, connection_manager: Any
+    ) -> Dict[str, str]:
         """Получение списка поддерживаемых форматов."""
         return await asyncio.to_thread(self.connection_manager.GetProtocolInfo)
 
@@ -326,7 +348,7 @@ class RuarkR5Controller:
         """Остановка воспроизведения."""
         playing = await self.is_playing()
         if playing:
-            await asyncio.to_thread(self.av_transport.Stop, InstanceID=0)
+            await self._call_upnp(self.av_transport.Stop, InstanceID=0)
             logger.info("⏹ Воспроизведение остановлено")
 
     async def next_track(self) -> None:
@@ -394,14 +416,14 @@ class RuarkR5Controller:
     #   RenderingControl
     async def get_volume(self) -> int:
         """Получение текущего уровня громкости."""
-        result = await asyncio.to_thread(
+        result = await self._call_upnp(
             self.rendering_control.GetVolume, InstanceID=0, Channel="Master"
         )
         return result["CurrentVolume"]
 
     async def set_volume(self, volume: int) -> None:
         """Установка громкости (0-100)."""
-        await asyncio.to_thread(
+        await self._call_upnp(
             self.rendering_control.SetVolume,
             InstanceID=0,
             Channel="Master",
@@ -432,7 +454,7 @@ class RuarkR5Controller:
         min_volume: int = 2,
         step: int = 6,
         delay: float = 0.1,
-    ):
+    ) -> None:
         """Плавное уменьшение громкости Ruark в несколько шагов."""
         volume = start_volume - start_volume % 2
 
@@ -472,17 +494,17 @@ class RuarkR5Controller:
         """Получение session_id через fsapi.
 
         Raises:
-            RuarkApiError: Если ответ fsapi не содержит sessionId.
+            RuarkApiError: Если запрос fsapi не удался или нет sessionId.
         """
         return await self._fsapi.create_session()
 
-    async def get_power_status(self) -> str:
-        """Получение статуса питания ('1' — включено, '0' — выключено).
+    async def is_powered_on(self) -> bool:
+        """Проверяет, включено ли питание Ruark.
 
         Raises:
-            RuarkApiError: Если ответ fsapi не содержит статус питания.
+            RuarkApiError: Если запрос fsapi не удался или статус не 0 и не 1.
         """
-        return await self._fsapi.get_power_status()
+        return await self._fsapi.is_powered_on()
 
     async def turn_power_on(self) -> bool:
         """Включение питания."""
@@ -491,6 +513,14 @@ class RuarkR5Controller:
     async def turn_power_off(self) -> bool:
         """Выключение питания."""
         return await self._fsapi.turn_power_off()
+
+    async def set_mode(self, mode_id: str) -> bool:
+        """Переключение режима по id из validModes, например AUXIN.
+
+        Raises:
+            RuarkApiError: Если запрос fsapi не удался или режима нет.
+        """
+        return await self._fsapi.set_mode(mode_id)
 
     def generate_metadata_with_fake_duration(
         self,

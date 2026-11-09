@@ -9,7 +9,7 @@ LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
-def setup_logging(service_name: str = "app"):
+def setup_logging(service_name: str = "app") -> None:
     """Настройка логирования.
 
     Args:
@@ -19,13 +19,10 @@ def setup_logging(service_name: str = "app"):
     """
     logging_config = {
         "version": 1,
-        "disable_existing_loggers": True,
+        # Логгеры модулей создаются при импорте, до этого вызова: без
+        # False они отключаются и оживают только под uvicorn
+        "disable_existing_loggers": False,
         "formatters": {
-            "default": {
-                "format": (
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-                )
-            },
             # Трейсбеки Formatter добавляет сам при наличии exc_info,
             # явный %(exc_info)s печатал None в каждой строке
             "detailed": {
@@ -52,13 +49,6 @@ def setup_logging(service_name: str = "app"):
         "root": {
             "handlers": ["console", "file"],
             "level": "DEBUG" if settings.debug else "INFO",
-        },
-        "loggers": {
-            "ruark_audio_system": {
-                "handlers": ["console", "file"],
-                "level": "INFO",
-                "propagate": False,
-            }
         },
     }
     dictConfig(logging_config)

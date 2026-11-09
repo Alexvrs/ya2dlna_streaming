@@ -1,5 +1,12 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   api_service:
+    image: ya2dlna_streaming
     build: .
     command: api
     volumes:
@@ -14,10 +21,12 @@ services:
     environment:
       - DOCKER_ENV=true
     restart: unless-stopped
+    logging: *default-logging
     network_mode: "host"
 
   dlna_server:
-    build: .
+    # Образ собирает api_service: одна сборка на оба сервиса
+    image: ya2dlna_streaming
     command: dlna
     volumes:
       - ${YA2DLNA_DATA_DIR:-.}/logs:/app/logs
@@ -29,4 +38,5 @@ services:
     environment:
       - DOCKER_ENV=true
     restart: unless-stopped
+    logging: *default-logging
     network_mode: "host"

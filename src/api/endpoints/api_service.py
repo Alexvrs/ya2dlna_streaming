@@ -1,5 +1,6 @@
 import asyncio
 from logging import getLogger
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from yandex_music.exceptions import YandexMusicError
@@ -16,8 +17,9 @@ logger = getLogger(__name__)
 
 router = APIRouter()
 
-# Ссылка на задачу запуска, чтобы её не собрал сборщик мусора
-_start_task: asyncio.Task[None] | None = None
+# Ссылки на задачи запуска, чтобы их не собрал сборщик мусора:
+# задача держится до своего завершения, повторный запрос её не вытесняет
+_start_tasks: set[asyncio.Task[None]] = set()
 
 
 def _get_manager(request: Request) -> MainStreamManager:
@@ -25,23 +27,29 @@ def _get_manager(request: Request) -> MainStreamManager:
     return request.app.state.main_stream_manager
 
 
+def _spawn_start(manager: MainStreamManager) -> None:
+    """Запускает стрим фоновой задачей и держит ссылку до её конца."""
+    task = asyncio.create_task(manager.start())
+    _start_tasks.add(task)
+    task.add_done_callback(_start_tasks.discard)
+
+
 @router.post("/stream_on")
-async def stream_on(request: Request):
+async def stream_on(request: Request) -> dict[str, str]:
     """API-команда для запуска стрима."""
-    global _start_task
-    _start_task = asyncio.create_task(_get_manager(request).start())
+    _spawn_start(_get_manager(request))
     return {"status": "stream_on"}
 
 
 @router.post("/shutdown")
-async def shutdown(request: Request):
+async def shutdown(request: Request) -> dict[str, str]:
     """API-команда для остановки стрима."""
     await _get_manager(request).stop()
     return {"status": "main_service stopped"}
 
 
 @router.get("/status")
-async def status(request: Request):
+async def status(request: Request) -> dict[str, Any]:
     """Состояние стрима: идёт ли, зона (только OwnTone), следующий трек."""
     output = request.app.state.audio_output
     zone = None
@@ -82,14 +90,14 @@ def _get_owntone(request: Request) -> OwnToneController:
 
 
 @router.get("/zones")
-async def zones(request: Request):
+async def zones(request: Request) -> dict[str, Any]:
     """Список зон и текущая зона."""
     owntone = _get_owntone(request)
     return {"zones": owntone.zones, "current": owntone.current_zone()}
 
 
 @router.post("/zone/{zone}")
-async def select_zone(request: Request, zone: str):
+async def select_zone(request: Request, zone: str) -> dict[str, str | None]:
     """Переключает зону воспроизведения; если музыка играет — на лету."""
     owntone = _get_owntone(request)
     try:
@@ -115,8 +123,7 @@ async def zone_on(
     previous = owntone.current_zone()
     await owntone.select_zone(zone)
     if not manager.is_running:
-        global _start_task
-        _start_task = asyncio.create_task(manager.start())
+        _spawn_start(manager)
         return "started"
     return "unchanged" if previous == zone else "switched"
 
@@ -138,7 +145,9 @@ async def zone_off(
 
 
 @router.post("/zone/{zone}/on")
-async def zone_on_endpoint(request: Request, zone: str):
+async def zone_on_endpoint(
+    request: Request, zone: str
+) -> dict[str, str | None]:
     """Включает стрим в зоне (для переключателей Алисы и Apple Home)."""
     owntone = _get_owntone(request)
     try:
@@ -151,7 +160,9 @@ async def zone_on_endpoint(request: Request, zone: str):
 
 
 @router.post("/zone/{zone}/off")
-async def zone_off_endpoint(request: Request, zone: str):
+async def zone_off_endpoint(
+    request: Request, zone: str
+) -> dict[str, str | None]:
     """Выключает стрим, если он играет в этой зоне."""
     owntone = _get_owntone(request)
     try:
@@ -162,7 +173,9 @@ async def zone_off_endpoint(request: Request, zone: str):
 
 
 @router.post("/zone/{zone}/volume/{volume}")
-async def zone_volume(request: Request, zone: str, volume: int):
+async def zone_volume(
+    request: Request, zone: str, volume: int
+) -> dict[str, Any]:
     """Громкость колонок зоны, 0–100 (не выше APP_OWNTONE_MAX_VOLUME)."""
     owntone = _get_owntone(request)
     manager = _get_manager(request)
@@ -250,7 +263,7 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
 
 
 @router.post("/player/{action}")
-async def player_endpoint(request: Request, action: str):
+async def player_endpoint(request: Request, action: str) -> dict[str, str]:
     """Команды плееру Станции с пульта.
 
     Трек и пауза: next, prev, play_pause; оценка: like, dislike;

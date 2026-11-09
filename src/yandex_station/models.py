@@ -1,6 +1,8 @@
 import time
 from dataclasses import dataclass, field
 
+from core.enums import TrackType
+
 
 @dataclass
 class Track:
@@ -8,7 +10,7 @@ class Track:
 
     id: str
     title: str
-    type: str
+    type: TrackType
     artist: str
     duration: float
     progress: float
@@ -22,5 +24,10 @@ class Track:
     # progress, поэтому ожидаемая позиция считается от него, а не от
     # конца итерации цикла (долгая итерация выглядела бы как перемотка)
     captured_at: float = field(
-        default_factory=time.monotonic, compare=False, repr=False
+        default_factory=lambda: time.monotonic(), compare=False, repr=False
     )
+
+    @property
+    def is_radio(self) -> bool:
+        """Станция играет радио, а не трек."""
+        return self.type == TrackType.FM_RADIO
