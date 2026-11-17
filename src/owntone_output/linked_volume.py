@@ -1,10 +1,27 @@
 import asyncio
 from logging import getLogger
-from typing import Any, Callable, Protocol
+from typing import Awaitable, Callable, Protocol, TypeVar
+
+import aiohttp
+from linkplay.bridge import LinkPlayBridge
+from linkplay.discovery import linkplay_factory_httpapi_bridge
+from linkplay.exceptions import LinkPlayException
+from linkplay.utils import async_create_unverified_client_session
 
 logger = getLogger(__name__)
 
 POLL_INTERVAL = 1.0
+
+ResultT = TypeVar("ResultT")
+
+# Сбои связи с колонкой: библиотека, сеть, TLS, неожиданный ответ
+LINKPLAY_ERRORS = (
+    LinkPlayException,
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    OSError,
+    ValueError,
+)
 
 
 class SpeakerError(Exception):
@@ -24,28 +41,28 @@ class SpeakerVolume(Protocol):
         """Устанавливает громкость и mute."""
         ...
 
+    async def close(self) -> None:
+        """Закрывает подключение к колонке."""
+        ...
+
 
 class LinkplayVolume:
-    """Громкость колонки WiiM/Linkplay через её HTTPS API.
+    """Громкость колонки WiiM/Linkplay через её HTTPS API."""
 
-    Ведомая колонка группы WiiM не принимает громкость ни по AirPlay,
-    ни по UPnP (обрывает соединение), а HTTPS API слушается. API требует
-    клиентский сертификат — его даёт библиотека python-linkplay.
-    """
+    # Ведомая колонка группы WiiM не принимает громкость ни по AirPlay,
+    # ни по UPnP (обрывает соединение), а HTTPS API слушается. API
+    # требует клиентский сертификат — его даёт python-linkplay
 
     def __init__(self, host: str) -> None:
         """Принимает IP-адрес колонки."""
         self.host = host
-        self._bridge: Any = None
-        self._session: Any = None
+        self._bridge: LinkPlayBridge | None = None
+        self._session: aiohttp.ClientSession | None = None
 
-    async def _get_bridge(self) -> Any:
+    async def _get_bridge(self) -> LinkPlayBridge:
         """Подключается к колонке (один раз, затем переиспользует)."""
         if self._bridge is not None:
             return self._bridge
-        from linkplay.discovery import linkplay_factory_httpapi_bridge
-        from linkplay.utils import async_create_unverified_client_session
-
         if self._session is None:
             self._session = await async_create_unverified_client_session()
         self._bridge = await linkplay_factory_httpapi_bridge(
@@ -53,31 +70,34 @@ class LinkplayVolume:
         )
         return self._bridge
 
-    async def _run(self, action: Callable[[Any], Any]) -> Any:
-        """Выполняет действие, при сбое сбрасывает подключение."""
+    async def _run(
+        self, action: Callable[[LinkPlayBridge], Awaitable[ResultT]]
+    ) -> ResultT:
+        """Выполняет действие, при сбое сбрасывает подключение.
+
+        Raises:
+            SpeakerError: Колонка недоступна или ответила ошибкой.
+        """
         try:
             return await action(await self._get_bridge())
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
+        except LINKPLAY_ERRORS as e:
             self._bridge = None
             raise SpeakerError(f"{self.host}: {e!r}") from e
 
     async def get(self) -> tuple[int, bool]:
         """Возвращает (громкость 0–100, mute)."""
 
-        async def read(bridge: Any) -> tuple[int, bool]:
+        async def read(bridge: LinkPlayBridge) -> tuple[int, bool]:
             await bridge.player.update_status()
             return int(bridge.player.volume), bool(bridge.player.muted)
 
-        result: tuple[int, bool] = await self._run(read)
-        return result
+        return await self._run(read)
 
     async def set(self, volume: int, mute: bool) -> None:
         """Устанавливает громкость и mute."""
         level = max(0, min(100, int(volume)))
 
-        async def write(bridge: Any) -> None:
+        async def write(bridge: LinkPlayBridge) -> None:
             await bridge.player.set_volume(level)
             await (bridge.player.mute() if mute else bridge.player.unmute())
 
@@ -92,13 +112,12 @@ class LinkplayVolume:
 
 
 class LinkedVolumeMirror:
-    """Повторяет громкость ведущей колонки на связанных с ней.
+    """Повторяет громкость ведущей колонки на связанных с ней."""
 
-    Стереопара WiiM (Linkplay) принимает громкость по AirPlay и с телефона
-    только ведущей колонкой; вторая остаётся на своей. Зеркало раз
-    в секунду читает громкость и mute ведущей и при изменении ставит то же
-    связанным — откуда бы громкость ни меняли (OwnTone, Алиса, телефон).
-    """
+    # Стереопара WiiM принимает громкость по AirPlay и с телефона только
+    # ведущей колонкой; вторая остаётся на своей. Зеркало раз в секунду
+    # читает ведущую и при изменении ставит то же связанным — откуда бы
+    # громкость ни меняли (OwnTone, Алиса, телефон)
 
     def __init__(
         self,
@@ -106,7 +125,7 @@ class LinkedVolumeMirror:
         interval: float = POLL_INTERVAL,
         speaker_factory: Callable[[str], SpeakerVolume] = LinkplayVolume,
     ) -> None:
-        """links: адрес ведущей колонки → адреса связанных."""
+        """Принимает адрес ведущей колонки → адреса связанных."""
         self._pairs = [
             (speaker_factory(master), [speaker_factory(h) for h in partners])
             for master, partners in links.items()
@@ -136,9 +155,7 @@ class LinkedVolumeMirror:
             self._task = None
         for master, partners in self._pairs:
             for speaker in [master, *partners]:
-                close = getattr(speaker, "close", None)
-                if close:
-                    await close()
+                await speaker.close()
 
     async def _run(self) -> None:
         while True:
@@ -147,7 +164,7 @@ class LinkedVolumeMirror:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Цикл не должен умирать молча: логируем и продолжаем
+                # Последний слой: цикл не должен умирать молча
                 logger.exception(f"❌ Зеркало громкости: {e}")
             await asyncio.sleep(self._interval)
 

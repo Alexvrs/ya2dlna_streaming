@@ -1,10 +1,17 @@
 import asyncio
 import time
 from logging import getLogger
-from typing import Any
+from typing import Sequence, TypeVar
 
 import aiohttp
+from pydantic import BaseModel, JsonValue, ValidationError
 
+from owntone_output.models import (
+    OutputsReply,
+    OwnToneOutput,
+    OwnTonePlayer,
+    QueueAddReply,
+)
 from owntone_output.zone_store import StartVolumeStore, ZoneStore
 from yandex_station.constants import RUARK_IDLE_VOLUME
 
@@ -22,6 +29,8 @@ START_VOLUME_PIN_DELAYS = (1.5, 4.0)
 # Сколько ждать начала игры, чтобы закрепить стартовую громкость
 START_VOLUME_WAIT = 30.0
 
+ReplyT = TypeVar("ReplyT", bound=BaseModel)
+
 
 class OwnToneError(Exception):
     """Ошибка обращения к OwnTone."""
@@ -32,13 +41,11 @@ class OwnToneZoneError(OwnToneError):
 
 
 class OwnToneController:
-    """Вывод звука через OwnTone: AirPlay 2, несколько колонок синхронно.
+    """Вывод звука через OwnTone: AirPlay 2, несколько колонок синхронно."""
 
-    Повторяет интерфейс RuarkR5Controller (см. core.audio_output), чтобы
-    остальной код не зависел от устройства. Вместо одного устройства —
-    зона: именованный набор выходов OwnTone. Питание моделируется выбором
-    выходов: «включено» — выходы зоны выбраны в OwnTone.
-    """
+    # Повторяет интерфейс RuarkR5Controller (core.audio_output). Вместо
+    # устройства — зона: именованный набор выходов OwnTone; «включено» —
+    # выходы зоны выбраны в OwnTone
 
     def __init__(
         self,
@@ -62,8 +69,8 @@ class OwnToneController:
         self._stream_url: str | None = None
         # Метаданные текущего трека для дисплеев (AirPlay, WiiM, Apple TV)
         self._metadata: dict[str, str] = {}
-        # Имя выхода OwnTone → его id (обновляется при каждом запросе)
-        self._outputs: dict[str, dict[str, Any]] = {}
+        # Имя выхода OwnTone → выход (обновляется при каждом запросе)
+        self._outputs: dict[str, OwnToneOutput] = {}
         self._recheck_task: asyncio.Task[None] | None = None
         # Фоновый замер «через сколько OwnTone заиграл»
         self._timing_task: asyncio.Task[None] | None = None
@@ -76,8 +83,8 @@ class OwnToneController:
         method: str,
         path: str,
         params: dict[str, str] | None = None,
-        json: Any = None,
-    ) -> Any:
+        json: JsonValue = None,
+    ) -> JsonValue:
         """Выполняет запрос к JSON API OwnTone.
 
         Raises:
@@ -99,15 +106,33 @@ class OwnToneController:
                     body = await resp.read()
                     if not body:
                         return None
-                    return await resp.json(content_type=None)
+                    data: JsonValue = await resp.json(content_type=None)
+                    return data
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             raise OwnToneError(f"{method} {path}: {e!r}") from e
 
-    async def _refresh_outputs(self) -> dict[str, dict[str, Any]]:
+    @staticmethod
+    def _parse(model: type[ReplyT], data: JsonValue, path: str) -> ReplyT:
+        """Проверяет ответ OwnTone; пустой ответ — модель по умолчанию.
+
+        Raises:
+            OwnToneError: Ответ не похож на ожидаемый.
+        """
+        try:
+            return model.model_validate(data or {})
+        except ValidationError as e:
+            raise OwnToneError(f"{path}: неожиданный ответ {e}") from e
+
+    async def _get_player(self) -> OwnTonePlayer:
+        """Состояние плеера OwnTone."""
+        data = await self._request("GET", "/player")
+        return self._parse(OwnTonePlayer, data, "/player")
+
+    async def _refresh_outputs(self) -> dict[str, OwnToneOutput]:
         """Перечитывает список выходов OwnTone."""
         data = await self._request("GET", "/outputs")
-        outputs = data.get("outputs", []) if isinstance(data, dict) else []
-        self._outputs = {o["name"]: o for o in outputs if "name" in o}
+        reply = self._parse(OutputsReply, data, "/outputs")
+        self._outputs = {o.name: o for o in reply.outputs}
         return self._outputs
 
     # ---- Зоны ---------------------------------------------------------
@@ -126,6 +151,15 @@ class OwnToneController:
             return self._default_zone
         return next(iter(self._zones), None)
 
+    def _require_zone(self, zone: str) -> None:
+        """Проверяет, что зона настроена.
+
+        Raises:
+            OwnToneZoneError: Зона не настроена.
+        """
+        if zone not in self._zones:
+            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+
     def _zone_output_names(self, zone: str | None) -> list[str]:
         """Имена выходов зоны; без зон — все колонки в сети."""
         if zone and zone in self._zones:
@@ -133,7 +167,7 @@ class OwnToneController:
         return [
             name
             for name, o in self._outputs.items()
-            if o.get("type") not in LOCAL_OUTPUT_TYPES
+            if o.type not in LOCAL_OUTPUT_TYPES
         ]
 
     def _zone_output_ids(self, zone: str | None) -> list[str]:
@@ -142,9 +176,7 @@ class OwnToneController:
         missing = [n for n in names if n not in self._outputs]
         if missing:
             logger.warning(f"⚠️ Зона «{zone}»: нет в сети {missing}")
-        return [
-            str(self._outputs[n]["id"]) for n in names if n in self._outputs
-        ]
+        return [self._outputs[n].id for n in names if n in self._outputs]
 
     async def _apply_zone(self) -> list[str]:
         """Выбирает в OwnTone выходы текущей зоны.
@@ -157,8 +189,13 @@ class OwnToneController:
         ids = self._zone_output_ids(zone)
         if not ids:
             raise OwnToneZoneError(f"Колонки зоны «{zone}» не найдены")
-        await self._request("PUT", "/outputs/set", json={"outputs": ids})
+        await self._select_outputs(ids)
         return ids
+
+    async def _select_outputs(self, ids: Sequence[str]) -> None:
+        """Выбирает в OwnTone ровно эти выходы (пустой — ни одного)."""
+        outputs: list[JsonValue] = list(ids)
+        await self._request("PUT", "/outputs/set", json={"outputs": outputs})
 
     async def select_zone(self, zone: str) -> None:
         """Переключает зону; если музыка играет — сразу, на лету.
@@ -166,8 +203,7 @@ class OwnToneController:
         Raises:
             OwnToneZoneError: Зона не настроена.
         """
-        if zone not in self._zones:
-            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        self._require_zone(zone)
         self._zone_store.save(zone)
         logger.info(f"🔈 Выбрана зона «{zone}»")
         if await self.is_playing():
@@ -182,50 +218,39 @@ class OwnToneController:
         Raises:
             OwnToneZoneError: Зона не настроена.
         """
-        if zone not in self._zones:
-            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        self._require_zone(zone)
         outputs = await self._refresh_outputs()
         levels = [
-            int(outputs[name].get("volume", 0))
+            outputs[name].volume
             for name in self._zones[zone]
             if name in outputs
         ]
         return max(levels) if levels else None
 
     async def set_zone_volume(self, zone: str, volume: int) -> int:
-        """Ставит громкость всем колонкам зоны (не выше потолка).
-
-        Работает и когда зона не играет: уровень сохранится в OwnTone
-        до следующего включения.
+        """Ставит громкость всем колонкам зоны, не выше потолка.
 
         Returns:
             int: Установленная громкость.
         Raises:
             OwnToneZoneError: Зона не настроена или её колонок нет в сети.
         """
-        if zone not in self._zones:
-            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        self._require_zone(zone)
         target = self._clamp(volume)
-        outputs = await self._refresh_outputs()
-        ids = [
-            str(outputs[n]["id"]) for n in self._zones[zone] if n in outputs
-        ]
+        await self._refresh_outputs()
+        ids = self._zone_output_ids(zone)
         if not ids:
             raise OwnToneZoneError(f"Колонки зоны «{zone}» не найдены")
-        for output_id in ids:
-            await self._request(
-                "PUT", f"/outputs/{output_id}", json={"volume": target}
-            )
+        # Зона может и не играть: OwnTone сохранит уровень до включения
+        await self._set_outputs_volume(ids, target)
         logger.info(f"🔊 Громкость зоны «{zone}»: {target}")
         self._remember_zone_volume(zone, target)
         return target
 
     def _remember_zone_volume(self, zone: str, volume: int) -> None:
-        """Сохраняет громкость зоны для следующего включения.
-
-        Тишину не запоминаем: стрим, включившийся в тишине, выглядит
-        сломанным (и приглушение на речь Алисы — не выбор громкости).
-        """
+        """Сохраняет громкость зоны для следующего включения."""
+        # Тишину не запоминаем: стрим, включившийся в тишине, выглядит
+        # сломанным, а приглушение на речь Алисы — не выбор громкости
         if volume > RUARK_IDLE_VOLUME:
             self._start_volumes.put(zone, volume)
 
@@ -233,35 +258,28 @@ class OwnToneController:
         """Ограничивает громкость диапазоном 0…max_volume."""
         return max(0, min(self._max_volume, int(volume)))
 
-    async def _cap_output_volumes(self, ids: list[str]) -> None:
+    async def _cap_output_volumes(self, ids: Sequence[str]) -> None:
         """Опускает до потолка громкость выбранных колонок."""
         outputs = await self._refresh_outputs()
         for o in outputs.values():
-            if (
-                str(o.get("id")) in ids
-                and o.get("volume", 0) > self._max_volume
-            ):
+            if o.id in ids and o.volume > self._max_volume:
                 logger.warning(
-                    f"🔉 «{o['name']}»: громкость {o['volume']} выше "
+                    f"🔉 «{o.name}»: громкость {o.volume} выше "
                     f"потолка, ставим {self._max_volume}"
                 )
-                await self._request(
-                    "PUT",
-                    f"/outputs/{o['id']}",
-                    json={"volume": self._max_volume},
-                )
+                await self._set_outputs_volume([o.id], self._max_volume)
 
-    async def _recheck_volumes_later(self, ids: list[str]) -> None:
+    async def _recheck_volumes_later(self, ids: Sequence[str]) -> None:
         """Повторно опускает до потолка громкость после подключения колонок."""
         try:
             await asyncio.sleep(VOLUME_RECHECK_DELAY)
             await self._cap_output_volumes(ids)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
+        except OwnToneError as e:
             logger.warning(f"⚠️ Повторная проверка громкости не удалась: {e}")
 
-    async def _set_outputs_volume(self, ids: list[str], volume: int) -> None:
+    async def _set_outputs_volume(
+        self, ids: Sequence[str], volume: int
+    ) -> None:
         """Ставит громкость указанным выходам OwnTone."""
         for output_id in ids:
             await self._request(
@@ -269,10 +287,7 @@ class OwnToneController:
             )
 
     async def set_start_volume(self, volume: int) -> int:
-        """Стартовая громкость сеанса: всем колонкам текущей зоны.
-
-        Закрепляется ещё раз, когда OwnTone начнёт играть: колонка
-        при подключении по AirPlay может навязать свою громкость.
+        """Ставит стартовую громкость сеанса всем колонкам текущей зоны.
 
         Raises:
             OwnToneZoneError: Колонок зоны нет в сети.
@@ -282,8 +297,9 @@ class OwnToneController:
         target = self._clamp(override if override is not None else volume)
         ids = await self._apply_zone()
         await self._set_outputs_volume(ids, target)
-        # play() выполняет другой процесс (DLNA-сервер), поэтому начало игры
-        # ждём здесь и закрепляем громкость после подключения колонок
+        # Колонка при подключении по AirPlay может навязать свою громкость,
+        # а play() выполняет другой процесс (DLNA-сервер): начало игры
+        # ждём здесь и закрепляем громкость ещё раз
         if self._pin_task and not self._pin_task.done():
             self._pin_task.cancel()
         self._pin_task = asyncio.create_task(
@@ -293,14 +309,13 @@ class OwnToneController:
         logger.info(f"🔊 Стартовая громкость: {target} ({source})")
         return target
 
-    async def _pin_start_volume(self, ids: list[str], volume: int) -> None:
+    async def _pin_start_volume(self, ids: Sequence[str], volume: int) -> None:
         """Ждёт начала игры и закрепляет стартовую громкость."""
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + START_VOLUME_WAIT
             while loop.time() < deadline:
-                player = await self._request("GET", "/player")
-                if player and player.get("state") == "play":
+                if (await self._get_player()).state == "play":
                     break
                 await asyncio.sleep(0.5)
             else:
@@ -310,9 +325,7 @@ class OwnToneController:
                 await asyncio.sleep(max(0.0, started + delay - loop.time()))
                 await self._set_outputs_volume(ids, volume)
             logger.info(f"🔊 Стартовая громкость {volume} закреплена")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
+        except OwnToneError as e:
             logger.warning(f"⚠️ Не удалось закрепить стартовую громкость: {e}")
 
     def remember_start_volume(self, zone: str, volume: int) -> int:
@@ -321,8 +334,7 @@ class OwnToneController:
         Raises:
             OwnToneZoneError: Зона не настроена.
         """
-        if zone not in self._zones:
-            raise OwnToneZoneError(f"Неизвестная зона «{zone}»")
+        self._require_zone(zone)
         target = self._clamp(volume)
         self._start_volumes.put(zone, target)
         logger.info(f"🔊 Зона «{zone}» включится с громкостью {target}")
@@ -346,8 +358,7 @@ class OwnToneController:
 
     async def get_volume(self) -> int:
         """Общая громкость OwnTone, 0–100."""
-        player = await self._request("GET", "/player")
-        return int(player.get("volume", 0)) if player else 0
+        return (await self._get_player()).volume
 
     async def set_volume(self, volume: int) -> None:
         """Общая громкость OwnTone (пропорционально для всех колонок)."""
@@ -408,22 +419,14 @@ class OwnToneController:
             "artwork_url": artwork_url,
         }
 
-    async def _apply_metadata(self, added: Any) -> None:
-        """Записывает метаданные в элемент очереди OwnTone.
-
-        OwnTone передаёт их по AirPlay: название, исполнитель, альбом
-        и обложка видны в WiiM и на экране Apple TV.
-        """
+    async def _apply_metadata(self, added: QueueAddReply) -> None:
+        """Записывает метаданные в элемент очереди OwnTone."""
+        # OwnTone передаёт их по AirPlay: название, исполнитель, альбом
+        # и обложка видны в WiiM и на экране Apple TV
         params = {k: v for k, v in self._metadata.items() if v}
         if not params:
             return
-        items = added.get("items") if isinstance(added, dict) else None
-        item_id = (
-            items[0].get("id")
-            if items and isinstance(items[0], dict)
-            else None
-        )
-        target = str(item_id) if item_id is not None else "now_playing"
+        target = added.items[0].id if added.items else "now_playing"
         try:
             await self._request("PUT", f"/queue/items/{target}", params=params)
         except OwnToneError as e:
@@ -443,13 +446,15 @@ class OwnToneController:
         await self._cap_output_volumes(ids)
         cap_done = time.monotonic()
         await self._request("PUT", "/queue/clear")
-        added = await self._request(
+        data = await self._request(
             "POST",
             "/queue/items/add",
             params={"uris": self._stream_url, "playback": "start"},
         )
         add_done = time.monotonic()
-        await self._apply_metadata(added)
+        await self._apply_metadata(
+            self._parse(QueueAddReply, data, "/queue/items/add")
+        )
         logger.info(
             f"⏱ OwnTone play: зона {zone_done - started:.2f}с, "
             f"потолок громкости {cap_done - zone_done:.2f}с, очередь "
@@ -474,12 +479,12 @@ class OwnToneController:
         deadline = since + timeout
         try:
             while time.monotonic() < deadline:
-                player = await self._request("GET", "/player")
-                if isinstance(player, dict) and player.get("state") == "play":
+                player = await self._get_player()
+                if player.state == "play":
                     logger.info(
                         f"⏱ OwnTone играет через "
                         f"{time.monotonic() - since:.2f}с после очереди "
-                        f"(позиция {player.get('item_progress_ms')} мс)"
+                        f"(позиция {player.item_progress_ms} мс)"
                     )
                     return
                 await asyncio.sleep(interval)
@@ -492,32 +497,24 @@ class OwnToneController:
         await self._request("PUT", "/player/stop")
 
     async def player_progress(self) -> tuple[str, int] | None:
-        """Состояние плеера и позиция элемента (мс) или None.
-
-        Позиция совпадает со слышимым звуком (опыт E4, ±0,03 с) —
-        по ней бесшовный режим меряет задержку колонок от Станции.
-        """
+        """Состояние плеера и позиция элемента в мс; None — нет ответа."""
+        # Позиция совпадает со слышимым звуком (опыт E4, ±0,03 с): по ней
+        # бесшовный режим меряет задержку колонок от Станции
         try:
-            player = await self._request("GET", "/player")
+            player = await self._get_player()
         except OwnToneError as e:
             logger.debug(f"OwnTone: позиция не получена: {e}")
             return None
-        if not isinstance(player, dict):
-            return None
-        return str(player.get("state")), int(
-            player.get("item_progress_ms") or 0
-        )
+        return player.state, player.item_progress_ms or 0
 
     async def is_playing(self, timeout: float = 5.0) -> bool:
         """Проверяет, играет ли OwnTone хотя бы на одну колонку."""
         try:
-            player = await asyncio.wait_for(
-                self._request("GET", "/player"), timeout
-            )
-            if not player or player.get("state") != "play":
+            player = await asyncio.wait_for(self._get_player(), timeout)
+            if player.state != "play":
                 return False
             outputs = await self._refresh_outputs()
-            return any(o.get("selected") for o in outputs.values())
+            return any(o.selected for o in outputs.values())
         except (OwnToneError, asyncio.TimeoutError) as e:
             logger.debug(f"OwnTone: состояние не получено: {e}")
             return False
@@ -532,7 +529,7 @@ class OwnToneController:
         """Проверяет, выбрана ли хоть одна колонка зоны."""
         outputs = await self._refresh_outputs()
         names = set(self._zone_output_names(self.current_zone()))
-        return any(o.get("selected") for n, o in outputs.items() if n in names)
+        return any(o.selected for n, o in outputs.items() if n in names)
 
     async def set_mode(self, mode_id: str) -> bool:
         """Режимов источника у OwnTone нет — ничего не делает."""
@@ -547,5 +544,5 @@ class OwnToneController:
     async def turn_power_off(self) -> bool:
         """Останавливает звук и отпускает все колонки."""
         await self.stop()
-        await self._request("PUT", "/outputs/set", json={"outputs": []})
+        await self._select_outputs([])
         return True

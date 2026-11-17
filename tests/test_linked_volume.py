@@ -25,6 +25,9 @@ class FakeSpeaker:
         self.volume, self.mute = volume, mute
         self.sets += 1
 
+    async def close(self) -> None:
+        pass
+
 
 def make_mirror() -> tuple[LinkedVolumeMirror, FakeSpeaker, FakeSpeaker]:
     FakeSpeaker.registry.clear()
