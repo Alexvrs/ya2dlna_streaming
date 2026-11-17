@@ -10,6 +10,7 @@ from typing import Any
 
 import aiohttp
 from injector import inject
+from pydantic import JsonValue
 
 from core.authorization.yandex_tokens import get_device_token
 from core.backoff import ExponentialBackoff
@@ -32,12 +33,9 @@ logger = logging.getLogger(__name__)
 raw_logger = logging.getLogger("yandex_station.raw")
 
 
-def raw_state_line(data: Any, now: float) -> str | None:
-    """Строка сырого журнала: время прихода и всё о плеере и Алисе.
-
-    Из сообщения берутся только состояние (playerState целиком,
-    aliceState, playing, громкость) — без тяжёлого extra.appState.
-    """
+def raw_state_line(data: JsonValue, now: float) -> str | None:
+    """Строка сырого журнала: время прихода и всё о плеере и Алисе."""
+    # Только состояние: без тяжёлого extra.appState
     state = data.get("state") if isinstance(data, dict) else None
     if not isinstance(state, dict):
         return None

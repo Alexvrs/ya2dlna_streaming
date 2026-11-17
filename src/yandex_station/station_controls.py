@@ -4,6 +4,7 @@ from logging import getLogger
 from typing import Any
 
 from injector import inject
+from pydantic import JsonValue
 
 from core.config.settings import settings
 from core.enums import AliceState, TrackType
@@ -175,9 +176,11 @@ class YandexStationControls:
             return None
 
     @staticmethod
-    def _cover_uri(player_state: Any) -> str | None:
+    def _cover_uri(player_state: JsonValue) -> str | None:
         """Ссылка на обложку из extra.coverURI состояния плеера."""
-        extra = player_state.get("extra") if player_state else None
+        if not isinstance(player_state, dict):
+            return None
+        extra = player_state.get("extra")
         cover = extra.get("coverURI") if isinstance(extra, dict) else None
         return str(cover) if cover else None
 

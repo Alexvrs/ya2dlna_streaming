@@ -1,6 +1,8 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+from yandex_music.exceptions import NetworkError
+
 from main_stream_service.main_stream_manager import MainStreamManager
 from main_stream_service.yandex_music_api import TrackInfo, YandexMusicAPI
 from ruark_audio_system.ruark_r5_controller import RuarkR5Controller
@@ -72,7 +74,7 @@ async def test_radio_uses_station_cover_without_api():
 
 async def test_api_failure_does_not_break_stream():
     manager, api = make()
-    api.get_track_meta.side_effect = RuntimeError("сеть")
+    api.get_track_meta.side_effect = NetworkError("сеть")
     assert await manager._track_meta(track()) == {"album": "", "cover": ""}
 
 

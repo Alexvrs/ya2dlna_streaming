@@ -15,7 +15,7 @@ import aiohttp
 from fastapi import HTTPException, Response
 from fastapi.responses import StreamingResponse
 
-from core.audio_output import AudioOutput
+from core.audio_output import AudioOutput, MetadataOutput
 from core.config.settings import settings
 from core.enums import Codec
 from core.http_redirects import resolve_redirects
@@ -159,10 +159,9 @@ class StreamHandler:
             artist=artist,
             mime_type=self.didl_media_type,
         )
-        set_metadata = getattr(self._ruark_controls, "set_metadata", None)
-        if set_metadata is not None:
+        if isinstance(self._ruark_controls, MetadataOutput):
             album, cover = self._now_playing_extra
-            await set_metadata(
+            await self._ruark_controls.set_metadata(
                 title=title, artist=artist, album=album, artwork_url=cover
             )
         await self.execute_with_lock(self._ruark_controls.play)
@@ -261,8 +260,7 @@ class StreamHandler:
 
         Args:
             radio (bool): Режим радио.
-            user_agent (str): User-Agent клиента. Проба сканера OwnTone
-                (Lavf/…) получает пустой ответ и не трогает pipe.
+            user_agent (str): User-Agent клиента, проба OwnTone — пустой ответ.
         """
         proc = self._ffmpeg.process
         if not proc or proc.stdout is None:
@@ -435,11 +433,9 @@ class StreamHandler:
         resolved: bool = False,
         tid: str = "",
     ) -> None:
-        """Запускает потоковую трансляцию и передает её на Ruark.
-
-        tid — номер перехода из менеджера: по нему строки журналов
-        двух процессов склеиваются (time.monotonic у них общий).
-        """
+        """Запускает потоковую трансляцию и передает её на Ruark."""
+        # tid — номер перехода из менеджера: по нему склеиваются журналы
+        # двух процессов (time.monotonic у них общий)
         self._now_playing = (title or DEFAULT_STREAM_TITLE, artist)
         self._now_playing_extra = (album, cover)
         logger.info(

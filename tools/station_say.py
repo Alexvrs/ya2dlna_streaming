@@ -1,9 +1,8 @@
-"""Отправить Станции текстовую команду (glagol sendText), как будто её сказали голосом.
+"""Отправляет Станции текстовую команду, как будто её сказали голосом."""
 
-Для подбора фраз режимов (DJ, кроссфейд): python tools/station_say.py "включи кроссфейд"
-Запуск из корня проекта с окружением сервиса: PYTHONPATH=src .venv/bin/python tools/station_say.py "..."
-Glagol допускает несколько подключений — работающий стрим не трогается.
-"""
+# Запуск из корня проекта:
+#   PYTHONPATH=src .venv/bin/python tools/station_say.py "включи кроссфейд"
+# Glagol допускает несколько подключений — работающий стрим не трогается
 
 import asyncio
 import sys
@@ -13,6 +12,7 @@ from yandex_station.station_ws_control import YandexStationClient
 
 
 async def main(text: str) -> int:
+    """Отправляет фразу и печатает ответ; код выхода 1 — нет связи."""
     container = MainDIContainer().get_container()
     # Отдельный клиент, не синглтон сервиса: своё подключение к Станции
     client = YandexStationClient(

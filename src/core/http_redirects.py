@@ -14,14 +14,11 @@ async def try_resolve_redirects(
 ) -> str | None:
     """Проходит HTTP-перенаправления и возвращает конечный адрес.
 
-    Яндекс отдаёт ссылку на трек через 308 Permanent Redirect, который
-    FFmpeg 4.x (Debian 11 / Raspberry Pi OS bullseye) не понимает
-    и читает мусор («Invalid data found»). Конечный адрес FFmpeg
-    открывает любой версии.
-
     Returns:
         str | None: Конечный адрес или None при ошибке сети.
     """
+    # Яндекс отдаёт трек через 308, который FFmpeg 4.x (Debian 11)
+    # не понимает и читает мусор; конечный адрес открывает любой FFmpeg
     current = url
     client_timeout = aiohttp.ClientTimeout(total=timeout)
     try:

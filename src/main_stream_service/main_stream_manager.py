@@ -3,13 +3,17 @@ import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from logging import getLogger
-from typing import Any, Awaitable, Callable, TypedDict
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 from injector import inject
 from pydantic import JsonValue
 
-from core.audio_output import AudioOutput
+# Pydantic на Python 3.11 принимает в моделях только этот TypedDict
+from typing_extensions import TypedDict
+from yandex_music.exceptions import YandexMusicError
+
+from core.audio_output import AudioOutput, StartVolumeOutput
 from core.backoff import ExponentialBackoff
 from core.config.settings import settings
 from core.covers import cover_url
@@ -432,8 +436,7 @@ class MainStreamManager:
         """Итерация бесшовного режима.
 
         Returns:
-            True — итерация обработана; False — классический путь
-            (режим выключен или играет радио).
+            bool: False — классический путь (режим выключен или радио).
         """
         runner = self._gapless_runner
         if runner is None:
@@ -466,11 +469,7 @@ class MainStreamManager:
     async def _gapless_speech(
         self, alice_state: AliceState | None, ctx: "_CycleContext"
     ) -> None:
-        """Колонки тише, пока Алиса слушает или отвечает (как раньше).
-
-        После команды колонки возвращают громкость; если трек
-        продолжается без диджея, Станция снова гаснет.
-        """
+        """Приглушает колонки, пока Алиса слушает или отвечает."""
         runner = self._gapless_runner
         await self._duck_ruark_on_alice_speech(alice_state, ctx)
         if alice_state in ALICE_ACTIVE_STATES:
@@ -480,6 +479,7 @@ class MainStreamManager:
             return
         await self._restore_ruark_volume(ctx)
         ctx.speak_count = 0
+        # Трек продолжается без диджея — Станция снова гаснет
         if (
             runner is not None
             and runner.active
@@ -857,14 +857,12 @@ class MainStreamManager:
 
     @staticmethod
     async def _expand_source(source: TrackSource) -> TrackSource:
-        """Проходит 308-перенаправления Яндекса заранее.
-
-        Тогда сервер стрима на смене трека сразу запускает FFmpeg,
-        без лишнего запроса к CDN. При ошибке сети ссылка остаётся
-        прежней, и перенаправления пройдёт сервер стрима.
-        """
+        """Заранее проходит 308-перенаправления Яндекса."""
+        # Сервер стрима на смене трека сразу запустит FFmpeg, без лишнего
+        # запроса к CDN
         final = await try_resolve_redirects(source.url)
         if final is None:
+            # Сеть подвела: перенаправления пройдёт сервер стрима
             return source
         return TrackSource(url=final, codec=source.codec, resolved=True)
 
@@ -1171,12 +1169,7 @@ class MainStreamManager:
     async def _fade_alice_if_playing(
         self, track: Track, ctx: "_CycleContext"
     ) -> None:
-        """Плавно глушит Алису, пока трек или радио играют на Ruark.
-
-        Сразу после отправки потока колонки ещё молчат: станция гаснет
-        только когда вывод заиграл и прошла его задержка до звука —
-        иначе между станцией и колонками слышна пауза.
-        """
+        """Плавно глушит Алису, пока трек или радио играют на Ruark."""
         current_volume = await self._station_controls.get_volume()
 
         if not (
@@ -1193,6 +1186,8 @@ class MainStreamManager:
         ):
             return
 
+        # Сразу после отправки потока колонки молчат: станция гаснет, когда
+        # вывод заиграл и прошла его задержка до звука, иначе слышна пауза
         since_sent = time.monotonic() - ctx.last_stream_sent_at
         if since_sent < OUTPUT_START_TIMEOUT + OUTPUT_AUDIBLE_DELAY:
             if not await self._wait_output_playing(OUTPUT_START_TIMEOUT):
@@ -1305,23 +1300,18 @@ class MainStreamManager:
             return
         self._volume_store.save(self._ruark_volume)
         # OwnTone: громкость зоны — стартовая при следующем включении
-        remember = getattr(
-            self._ruark_controls, "remember_session_volume", None
-        )
-        if remember is not None:
-            remember(self._ruark_volume)
+        if isinstance(self._ruark_controls, StartVolumeOutput):
+            self._ruark_controls.remember_session_volume(self._ruark_volume)
 
     async def _apply_start_volume(self, volume: int) -> None:
         """Ставит заданную стартовую громкость вместо прошлого сеанса."""
-        set_start = getattr(self._ruark_controls, "set_start_volume", None)
+        output = self._ruark_controls
         applied = volume
-        if set_start is not None:
-            result = await set_start(volume)
+        if isinstance(output, StartVolumeOutput):
             # Зона могла получить громкость, выставленную заранее
-            if isinstance(result, int):
-                applied = result
+            applied = await output.set_start_volume(volume)
         else:
-            await self._ruark_controls.set_volume(volume)
+            await output.set_volume(volume)
         self._ruark_volume = applied
         logger.info(f"🔊 Стартовая громкость стрима: {applied}")
 
@@ -1421,17 +1411,19 @@ class MainStreamManager:
             )
 
     async def _track_info(self, track_id: str) -> TrackInfo:
-        """Описание трека из API Музыки, кешируется по id.
-
-        Ошибка API кешируется пустым описанием: стрим и /status
-        не повторяют запрос каждую итерацию.
-        """
+        """Описание трека из API Музыки, кешируется по id."""
         cached = self._meta_cache.get(track_id)
         if cached is None:
             try:
                 cached = await self._yandex_music_api.get_track_meta(track_id)
-            except Exception as e:
-                logger.debug(f"Метаданные трека {track_id}: {e}")
+            except (
+                YandexMusicError,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as e:
+                # Пустое описание тоже в кеш: стрим и /status не повторяют
+                # запрос каждую итерацию
+                logger.debug(f"Метаданные трека {track_id}: {e!r}")
                 cached = TrackInfo()
             if len(self._meta_cache) >= TRACK_SOURCE_CACHE_SIZE:
                 self._meta_cache.pop(next(iter(self._meta_cache)))
@@ -1439,11 +1431,8 @@ class MainStreamManager:
         return cached
 
     async def _track_meta(self, track: Track) -> TrackMeta:
-        """Альбом и ссылка на обложку трека для дисплеев колонок.
-
-        Обложка — из состояния станции, иначе из API Музыки; альбом —
-        из API Музыки (кешируется по id). Ошибки не мешают стриму.
-        """
+        """Альбом и ссылка на обложку трека для дисплеев колонок."""
+        # Обложка — из состояния станции, иначе из API Музыки
         album, cover = "", track.cover
         if not track.is_radio and track.id and track.id != "0":
             info = await self._track_info(track.id)
@@ -1456,8 +1445,8 @@ class MainStreamManager:
     ) -> NextTrack | None:
         """Следующий трек очереди станции (entityInfo.next).
 
-        None — стрим не идёт, станция не сообщила следующий трек
-        (радио, конец очереди) или API Музыки не ответил за timeout.
+        Returns:
+            NextTrack | None: None — стрим стоит, радио, конец очереди, таймаут.
         """
         track = self._last_track
         if not self._stream_state_running or track is None:

@@ -1,11 +1,18 @@
 import asyncio
+from enum import StrEnum
 from logging import getLogger
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from yandex_music.exceptions import YandexMusicError
 
+from api.exceptions import (
+    NotATrackError,
+    StreamNotRunningError,
+    UnknownPlayerCommandError,
+)
+from api.models import StatusReply, ZonesReply, ZoneVolumeReply
 from core.config.settings import settings
+from core.enums import TrackType
 from main_stream_service.main_stream_manager import MainStreamManager
 from owntone_output.owntone_controller import (
     OwnToneController,
@@ -49,7 +56,7 @@ async def shutdown(request: Request) -> dict[str, str]:
 
 
 @router.get("/status")
-async def status(request: Request) -> dict[str, Any]:
+async def status(request: Request) -> StatusReply:
     """Состояние стрима: идёт ли, зона (только OwnTone), следующий трек."""
     output = request.app.state.audio_output
     zone = None
@@ -69,13 +76,12 @@ async def status(request: Request) -> dict[str, Any]:
             except OwnToneError:
                 volumes[name] = None
     manager = _get_manager(request)
-    return {
-        "running": manager.is_running,
-        "zone": zone,
-        "volumes": volumes,
-        # Следующий трек очереди станции или null (радио, конец очереди)
-        "next": await manager.next_track_info(),
-    }
+    return StatusReply(
+        running=manager.is_running,
+        zone=zone,
+        volumes=volumes,
+        next=await manager.next_track_info(),
+    )
 
 
 def _get_owntone(request: Request) -> OwnToneController:
@@ -90,10 +96,10 @@ def _get_owntone(request: Request) -> OwnToneController:
 
 
 @router.get("/zones")
-async def zones(request: Request) -> dict[str, Any]:
+async def zones(request: Request) -> ZonesReply:
     """Список зон и текущая зона."""
     owntone = _get_owntone(request)
-    return {"zones": owntone.zones, "current": owntone.current_zone()}
+    return ZonesReply(zones=owntone.zones, current=owntone.current_zone())
 
 
 @router.post("/zone/{zone}")
@@ -114,12 +120,11 @@ async def zone_on(
 ) -> str:
     """Включает стрим в зоне: выбирает её и запускает стрим, если он стоит.
 
-    Повтор для уже играющей зоны ничего не меняет — эхо от синхронизации
-    переключателей (Алиса, Apple Home) безвредно.
-
     Returns:
         str: Что сделано: started | switched | unchanged.
     """
+    # Повтор для играющей зоны ничего не меняет: эхо синхронизации
+    # переключателей (Алиса, Apple Home) безвредно
     previous = owntone.current_zone()
     await owntone.select_zone(zone)
     if not manager.is_running:
@@ -175,7 +180,7 @@ async def zone_off_endpoint(
 @router.post("/zone/{zone}/volume/{volume}")
 async def zone_volume(
     request: Request, zone: str, volume: int
-) -> dict[str, Any]:
+) -> ZoneVolumeReply:
     """Громкость колонок зоны, 0–100 (не выше APP_OWNTONE_MAX_VOLUME)."""
     owntone = _get_owntone(request)
     manager = _get_manager(request)
@@ -184,77 +189,82 @@ async def zone_volume(
         if not playing_here and settings.start_volume is not None:
             # Стрим в зоне не играет: громкость станет стартовой
             level = owntone.remember_start_volume(zone, volume)
-            return {
-                "status": "start_volume_set",
-                "zone": zone,
-                "volume": level,
-            }
+            return ZoneVolumeReply(
+                status="start_volume_set", zone=zone, volume=level
+            )
         level = await owntone.set_zone_volume(zone, volume)
     except OwnToneZoneError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except OwnToneError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return {"status": "volume_set", "zone": zone, "volume": level}
+    return ZoneVolumeReply(status="volume_set", zone=zone, volume=level)
 
 
-PLAYER_ACTIONS = (
-    "next",
-    "prev",
-    "play_pause",
-    "like",
-    "dislike",
-    "dj_on",
-    "dj_off",
-)
+class PlayerAction(StrEnum):
+    """Команды плееру Станции с пульта."""
+
+    NEXT = "next"
+    PREV = "prev"
+    PLAY_PAUSE = "play_pause"
+    LIKE = "like"
+    DISLIKE = "dislike"
+    DJ_ON = "dj_on"
+    DJ_OFF = "dj_off"
+
 
 # Режим диджея «Моей волны»: отдельной команды glagol нет, Алиса
 # переключает его по фразе (проверено на Станции 07.11.2026; «включи
 # диджея» и «включи кроссфейд» не срабатывают). Состояние не читается.
 DJ_PHRASES = {
-    "dj_on": "включи режим диджей",
-    "dj_off": "выключи режим диджей",
+    PlayerAction.DJ_ON: "включи режим диджей",
+    PlayerAction.DJ_OFF: "выключи режим диджей",
 }
 
 
 async def player_command(manager: MainStreamManager, action: str) -> str:
-    """Команда плееру Станции с пульта (ресивер «Стрим» в Apple Home).
+    """Отдаёт команду плееру Станции с пульта (ресивер «Стрим»).
 
-    Стрим сам следует за Станцией: смена трека, пауза и продолжение
-    подхватываются циклом менеджера, поэтому достаточно отдать команду
-    Станции. Пауза/продолжение — по тому, играет ли Станция сейчас.
-    Лайк и дизлайк — текущему треку в аккаунте Яндекс Музыки; после
-    дизлайка — следующий трек, как в самой Музыке.
-
+    Returns:
+        str: Что сделано: команда, liked, disliked, paused или playing.
     Raises:
-        ValueError: неизвестная команда.
-        RuntimeError: стрим не идёт — Станцией управляет она сама.
-        LookupError: лайк/дизлайк, а сейчас играет не трек (радио).
+        UnknownPlayerCommandError: Неизвестная команда.
+        StreamNotRunningError: Стрим не идёт — Станцией управляет она сама.
+        NotATrackError: Лайк или дизлайк, а играет не трек.
     """
-    if action not in PLAYER_ACTIONS:
-        raise ValueError(f"Неизвестная команда «{action}»")
+    try:
+        command = PlayerAction(action)
+    except ValueError as e:
+        raise UnknownPlayerCommandError(
+            f"Неизвестная команда «{action}»"
+        ) from e
     if not manager.is_running:
-        raise RuntimeError("Стрим не идёт")
+        raise StreamNotRunningError("Стрим не идёт")
+    # Стрим сам следует за Станцией: смену трека и паузу подхватывает
+    # цикл менеджера, поэтому достаточно команды Станции
     station = manager.station_controls
-    if action == "next":
-        await station.next()
-        return "next"
-    if action == "prev":
-        await station.prev()
-        return "prev"
-    if action in DJ_PHRASES:
-        await station.send_text(DJ_PHRASES[action])
-        return action
+    match command:
+        case PlayerAction.NEXT:
+            await station.next()
+            return command
+        case PlayerAction.PREV:
+            await station.prev()
+            return command
+        case PlayerAction.DJ_ON | PlayerAction.DJ_OFF:
+            await station.send_text(DJ_PHRASES[command])
+            return command
     track = await station.get_current_track()
-    if action in ("like", "dislike"):
-        if track is None or track.type != "Track" or not track.id:
-            raise LookupError("Сейчас играет не трек")
+    if command in (PlayerAction.LIKE, PlayerAction.DISLIKE):
+        if track is None or track.type != TrackType.TRACK or not track.id:
+            raise NotATrackError("Сейчас играет не трек")
         music = manager.yandex_music_api
-        if action == "like":
+        if command == PlayerAction.LIKE:
             await music.like_track(track.id)
             return "liked"
+        # После дизлайка — следующий трек, как в самой Музыке
         await music.dislike_track(track.id)
         await station.next()
         return "disliked"
+    # Пауза или продолжение — по тому, играет ли Станция сейчас
     if track is not None and track.playing:
         await station.stop()
         return "paused"
@@ -264,16 +274,12 @@ async def player_command(manager: MainStreamManager, action: str) -> str:
 
 @router.post("/player/{action}")
 async def player_endpoint(request: Request, action: str) -> dict[str, str]:
-    """Команды плееру Станции с пульта.
-
-    Трек и пауза: next, prev, play_pause; оценка: like, dislike;
-    режим диджея «Моей волны»: dj_on, dj_off.
-    """
+    """Команды плееру Станции: next, prev, play_pause, like, dislike, dj_*."""
     try:
         result = await player_command(_get_manager(request), action)
-    except ValueError as e:
+    except UnknownPlayerCommandError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    except (RuntimeError, LookupError) as e:
+    except (StreamNotRunningError, NotATrackError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except YandexMusicError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

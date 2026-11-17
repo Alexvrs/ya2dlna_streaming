@@ -1,13 +1,11 @@
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class AudioOutput(Protocol):
-    """Устройство вывода звука, на которое уходит локальный стрим.
+    """Устройство вывода звука, на которое уходит локальный стрим."""
 
-    Реализации: Ruark R5 (DLNA + fsapi) и OwnTone (AirPlay 2, мультирум).
-    Набор методов повторяет то, что вызывают MainStreamManager
-    и StreamHandler.
-    """
+    # Реализации: Ruark R5 (DLNA + fsapi) и OwnTone (AirPlay 2, мультирум);
+    # методы — те, что вызывают MainStreamManager и StreamHandler
 
     device_name: str
 
@@ -67,4 +65,32 @@ class AudioOutput(Protocol):
 
     async def set_mode(self, mode_id: str) -> bool:
         """Переключает режим источника (Ruark: режим покоя при остановке)."""
+        ...
+
+
+@runtime_checkable
+class MetadataOutput(Protocol):
+    """Вывод, показывающий альбом и обложку трека (OwnTone)."""
+
+    async def set_metadata(
+        self,
+        title: str = ...,
+        artist: str = ...,
+        album: str = ...,
+        artwork_url: str = ...,
+    ) -> None:
+        """Запоминает метаданные трека для следующего play()."""
+        ...
+
+
+@runtime_checkable
+class StartVolumeOutput(Protocol):
+    """Вывод, который сам помнит громкость зон между сеансами (OwnTone)."""
+
+    async def set_start_volume(self, volume: int) -> int:
+        """Ставит стартовую громкость, возвращает применённую."""
+        ...
+
+    def remember_session_volume(self, volume: int) -> None:
+        """Запоминает громкость сеанса при остановке стрима."""
         ...
