@@ -236,4 +236,4 @@ class FfmpegPcmSource:
             try:
                 self._proc.kill()
             except ProcessLookupError:
-                pass
+                logger.debug(f"Декодер {self.track_id} уже завершился")

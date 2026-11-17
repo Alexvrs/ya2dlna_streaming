@@ -2,6 +2,7 @@
 
 import asyncio
 
+import aiohttp
 import pytest
 
 from main_stream_service import gapless_runner as gr
@@ -215,7 +216,7 @@ async def test_error_in_segment_rolls_back_and_keeps_loop(env, monkeypatch):
 
     async def boom(path, body=None):
         if path == "/gapless/segment":
-            raise RuntimeError("сеть")
+            raise aiohttp.ClientError("сеть")
         return {
             "session": "s1",
             "stream_path": "/live/s1.wav",
