@@ -395,7 +395,9 @@ class GaplessRunner:
         # D меряется по item_progress_ms OwnTone: позиция совпадает
         # со слышимым звуком (опыт E4)
         heard = (
-            state.t0 + state.client_start_frame / SAMPLE_RATE + player[1] / 1000
+            state.t0
+            + state.client_start_frame / SAMPLE_RATE
+            + player[1] / 1000
         )
         delay = heard_at - heard
         if 2.0 < delay < 15.0:

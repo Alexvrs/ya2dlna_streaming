@@ -192,9 +192,7 @@ async def gapless_state(request: Request) -> GaplessState:
     hub = _hub(request)
     if hub.session is None:
         return GaplessState(closed=True)
-    return hub.session.state().model_copy(
-        update={"session": hub.session_name}
-    )
+    return hub.session.state().model_copy(update={"session": hub.session_name})
 
 
 @router.get("/cover/{track_id}.jpg")
