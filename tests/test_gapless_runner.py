@@ -81,12 +81,17 @@ def env(monkeypatch):
 
     runner = gr.GaplessRunner(Station(), Output(), resolve, info, clock=clock)
 
-    async def post(path, body):
+    async def post(path, body=None):
         if state["lost"] and path != "/gapless/start":
             raise gr.GaplessLost("409")
-        posts.append((path, body))
+        posts.append((path, {} if body is None else body.model_dump()))
         if path == "/gapless/start":
-            return {"stream_path": "/live/s1.wav", "t0": 990.0}
+            return {
+                "session": "s1",
+                "stream_path": "/live/s1.wav",
+                "t0": 990.0,
+                "w_start": 990.0,
+            }
         return {}
 
     async def get(path):
@@ -208,10 +213,15 @@ async def test_fade_skipped_when_speakers_silent(env, monkeypatch):
 async def test_error_in_segment_rolls_back_and_keeps_loop(env, monkeypatch):
     runner, posts, clock, _ = env
 
-    async def boom(path, body):
+    async def boom(path, body=None):
         if path == "/gapless/segment":
             raise RuntimeError("сеть")
-        return {"stream_path": "/live/s1.wav", "t0": 990.0}
+        return {
+            "session": "s1",
+            "stream_path": "/live/s1.wav",
+            "t0": 990.0,
+            "w_start": 990.0,
+        }
 
     monkeypatch.setattr(runner, "_post", boom)
     assert await runner.handle(track(), "IDLE") is False

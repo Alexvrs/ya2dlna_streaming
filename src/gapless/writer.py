@@ -1,18 +1,4 @@
-"""Писатель бесшовного потока: расписание → непрерывный PCM в темпе.
-
-Сессия (``GaplessSession``) держит расписание (``Timeline``), источники
-треков (``SourcePool``) и темп записи. Модель (план, раздел 0):
-
-- кадр потока ``f`` = момент Станции ``t0 + f/44100``;
-- ``t0 = w_start - lead - margin``: к моменту записи кадра событие
-  Станции о нём уже пришло (``margin`` ≥ задержка событий + запуск
-  декодера), а OwnTone держит впереди слышимого ``lead`` с данных;
-- пишем не быстрее реального времени + ``lead`` — иначе OwnTone
-  забирает ~37 с вперёд (опыт E3).
-
-Задержка D «Станция → колонки» складывается из lead, margin и буфера
-OwnTone (~3 с) и измеряется по ``item_progress_ms`` (опыт E4).
-"""
+"""Писатель бесшовного потока: расписание → непрерывный PCM в темпе."""
 
 from __future__ import annotations
 
@@ -22,6 +8,7 @@ import time
 from logging import getLogger
 from typing import AsyncIterator, Callable
 
+from .models import GaplessState, SegmentState
 from .pcm_source import FfmpegPcmSource, PcmSource
 from .timeline import BYTES_PER_FRAME, CHANNELS, SAMPLE_RATE, Segment, Timeline
 
@@ -102,7 +89,7 @@ class SourcePool:
         if (
             prepared is not None
             and prepared[1].start_offset <= need
-            and not getattr(prepared[1], "eof", False)
+            and not prepared[1].eof
         ):
             self._prepared.pop(seg.track_id)
             src = prepared[1]
@@ -115,12 +102,6 @@ class SourcePool:
             )
         self._by_segment[seg.seg_id] = src
         return src
-
-    def limit(self, seg_ids: set[int]) -> None:
-        """Держит декодеры только у ``seg_ids`` (последние сегменты)."""
-        for sid in list(self._by_segment):
-            if sid not in seg_ids:
-                self._by_segment.pop(sid).close()
 
     def retain(self, seg_ids: set[int]) -> None:
         """Закрывает декодеры сегментов, которых нет в ``seg_ids``."""
@@ -203,6 +184,11 @@ class GaplessSession:
         self.lead = lead
         self.margin = margin
         self.w_start = clock()
+        # Кадр f — момент Станции t0 + f/44100. Сдвиг на lead + margin:
+        # к записи кадра событие Станции о нём уже пришло (margin покрывает
+        # опоздание события и запуск декодера), а OwnTone держит lead
+        # секунд впереди слышимого. Задержка D «Станция → колонки» —
+        # lead + margin + буфер OwnTone (~3 с), см. план, раздел 0
         self.timeline = Timeline(self.w_start - lead - margin)
         self.pool = SourcePool(factory)
         self.renderer = Renderer(self.timeline, self.pool)
@@ -234,7 +220,7 @@ class GaplessSession:
             # не запускаем: никто не читает, процессы копились бы
             if self.client_connected:
                 self.pool.source_for(seg, max(seg.start_frame, self.frame))
-            self.pool.limit({s.seg_id for s in self.timeline.segments[-3:]})
+            self.pool.retain({s.seg_id for s in self.timeline.segments[-3:]})
             late = (self.frame - seg.start_frame) / SAMPLE_RATE
             logger.info(
                 f"🧩 Сегмент #{seg.seg_id} {track_id} с {pos_seconds:.2f}с, "
@@ -266,30 +252,28 @@ class GaplessSession:
         """Момент Станции для кадра потока."""
         return self.timeline.time_at(frame)
 
-    def state(self) -> dict[str, object]:
+    def state(self) -> GaplessState:
         """Состояние для /gapless/state."""
         now_frame = self.timeline.frame_at(self.clock())
         seg = self.timeline.active_at(self.frame)
-        return {
-            "closed": self.closed,
-            "frame": self.frame,
-            "write_ahead_s": round((self.frame - now_frame) / SAMPLE_RATE, 3),
-            "client_connected": self.client_connected,
-            "client_start_frame": self.client_start_frame,
-            "t0": self.timeline.t0,
-            "segment": (
+        return GaplessState(
+            closed=self.closed,
+            frame=self.frame,
+            write_ahead_s=round((self.frame - now_frame) / SAMPLE_RATE, 3),
+            client_connected=self.client_connected,
+            client_start_frame=self.client_start_frame,
+            t0=self.timeline.t0,
+            segment=(
                 None
                 if seg is None
-                else {
-                    "seg_id": seg.seg_id,
-                    "track_id": seg.track_id,
-                    "pos": round(seg.track_frame(self.frame) / SAMPLE_RATE, 3),
-                }
+                else SegmentState(
+                    seg_id=seg.seg_id,
+                    track_id=seg.track_id,
+                    pos=round(seg.track_frame(self.frame) / SAMPLE_RATE, 3),
+                )
             ),
-            "underrun_s": round(
-                self.renderer.underrun_frames / SAMPLE_RATE, 3
-            ),
-        }
+            underrun_s=round(self.renderer.underrun_frames / SAMPLE_RATE, 3),
+        )
 
     def meta_at(self, frame: int) -> dict[str, str]:
         """Описание трека, звучащего в кадре (для ICY)."""
@@ -317,6 +301,8 @@ class GaplessSession:
         self.client_connected = True
         try:
             while not self.closed and epoch == self.client_epoch:
+                # Не быстрее реального времени + lead: иначе OwnTone
+                # забирает ~37 с вперёд (опыт E3)
                 wait = (self.frame - self._allowed_frame()) / SAMPLE_RATE
                 if wait > 0:
                     await asyncio.sleep(wait)
@@ -349,11 +335,7 @@ def icy_block(meta: dict[str, str], cover_url: str = "") -> bytes:
 
 
 class IcyInterleaver:
-    """Вставляет метаданные ICY через каждые ``metaint`` байт аудио.
-
-    Блок с текстом шлётся только при смене описания, иначе — нулевой
-    байт длины (как у интернет-радио).
-    """
+    """Вставляет метаданные ICY через каждые ``metaint`` байт аудио."""
 
     def __init__(self, metaint: int = ICY_METAINT) -> None:
         self.metaint = metaint
@@ -370,6 +352,8 @@ class IcyInterleaver:
             self._since += n
             if self._since == self.metaint:
                 self._since = 0
+                # Текст только при смене описания, иначе нулевой байт
+                # длины, как у интернет-радио
                 if block != self._sent:
                     out += block
                     self._sent = block

@@ -1,20 +1,10 @@
-"""Расписание бесшовного потока: сегменты треков на шкале времени Станции.
-
-Поток — задержанная копия шкалы Станции. Кадр потока ``f`` (стерео, 16 бит)
-соответствует моменту Станции ``t0 + f / SAMPLE_RATE``. Сегмент говорит:
-«с момента Станции ``start_frame`` играет трек ``track_id`` с позиции
-``pos_frame``». Сегмент заканчивается следующим сегментом, явным концом
-(``end_frame`` — скип с диджеем, пауза) или концом файла трека (EOF
-декодера). Всё, что не покрыто сегментами, — тишина.
-
-Модуль без asyncio и без часов: всё в целых кадрах, поэтому стыки
-считаются точно и проверяются простыми тестами.
-"""
+"""Расписание бесшовного потока: сегменты треков на шкале времени Станции."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Без asyncio и часов: всё в целых кадрах, стыки считаются точно
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BYTES_PER_FRAME = 4  # s16le, стерео
@@ -22,25 +12,17 @@ BYTES_PER_FRAME = 4  # s16le, стерео
 
 @dataclass
 class Segment:
-    """Трек на шкале потока.
+    """Трек ``track_id`` с позиции ``pos_frame`` от кадра ``start_frame``."""
 
-    Attributes:
-        seg_id: Порядковый номер сегмента в сессии.
-        track_id: Идентификатор трека Станции.
-        start_frame: Кадр потока, с которого трек звучит.
-        pos_frame: Позиция трека (в кадрах) в момент ``start_frame``.
-        end_frame: Явный конец (не включая), None — до EOF/следующего.
-        eof_frame: Кадр потока, на котором у трека кончились данные.
-        meta: Описание для ICY: title, artist, album, cover.
-    """
-
-    seg_id: int
+    seg_id: int  # порядковый номер в сессии
     track_id: str
-    start_frame: int
-    pos_frame: int
+    start_frame: int  # кадр потока, с которого трек звучит
+    pos_frame: int  # позиция трека в кадрах в момент start_frame
+    # Явный конец, не включая (скип с диджеем, пауза); None — до EOF
+    # или следующего сегмента
     end_frame: int | None = None
-    eof_frame: int | None = None
-    meta: dict[str, str] = field(default_factory=dict)
+    eof_frame: int | None = None  # кадр, где у трека кончились данные
+    meta: dict[str, str] = field(default_factory=dict)  # title, artist, …
 
     def track_frame(self, frame: int) -> int:
         """Позиция трека (кадр) для кадра потока ``frame``."""
@@ -53,12 +35,7 @@ class Segment:
 
 
 class Timeline:
-    """Список сегментов и правило «что звучит в кадре ``f``».
-
-    Звучит последний по времени начала сегмент, который уже начался
-    и ещё не закончился. Новый сегмент, начавшийся раньше конца
-    предыдущего (скип, перемотка, кроссфейд Станции), перекрывает его.
-    """
+    """Сегменты потока и правило «что звучит в кадре ``f``»."""
 
     def __init__(self, t0: float) -> None:
         self.t0 = t0
@@ -88,12 +65,8 @@ class Timeline:
     ) -> Segment | None:
         """Добавляет сегмент «в момент Станции t трек был на позиции p».
 
-        Повтор того же трека, согласованный с уже заведённым сегментом
-        (позиция в пределах ``tolerance_frames``), ничего не меняет —
-        Станция шлёт состояние каждую секунду.
-
         Returns:
-            Новый сегмент или None, если это повтор существующего.
+            Segment | None: None — повтор уже заведённого сегмента.
         """
         start = self.frame_at(t_station)
         pos = max(0, round(pos_seconds * SAMPLE_RATE))
@@ -101,6 +74,8 @@ class Timeline:
             # Трек начнётся позже момента t: сдвигаем начало вперёд
             start += round(-pos_seconds * SAMPLE_RATE)
         current = self.active_at(start)
+        # Станция шлёт состояние каждую секунду: тот же трек с позицией
+        # в пределах допуска ничего не меняет
         if current is not None and current.track_id == track_id:
             if abs(current.track_frame(start) - pos) <= tolerance_frames:
                 return None
@@ -113,11 +88,7 @@ class Timeline:
         return seg
 
     def end_at(self, t_station: float) -> Segment | None:
-        """Явно заканчивает сегмент, звучащий в момент Станции t.
-
-        Returns:
-            Закрытый сегмент или None, если в этот момент тишина.
-        """
+        """Заканчивает сегмент, звучащий в момент Станции t; None — тишина."""
         frame = self.frame_at(t_station)
         seg = self.active_at(frame)
         # Сегменты, начатые позже этого момента (перемотка в последние
@@ -138,6 +109,8 @@ class Timeline:
 
     def active_at(self, frame: int) -> Segment | None:
         """Сегмент, звучащий в кадре ``frame``, или None (тишина)."""
+        # Звучит последний начавшийся и не закончившийся: новый сегмент
+        # (скип, перемотка, кроссфейд Станции) перекрывает предыдущий
         for seg in reversed(self._segments):
             if seg.start_frame > frame:
                 continue
@@ -161,10 +134,8 @@ class Timeline:
         return min(cands) if cands else None
 
     def prune(self, before_frame: int) -> None:
-        """Забывает сегменты, закончившиеся до ``before_frame``.
-
-        Оставляет хотя бы один сегмент — для повтора и ресинка.
-        """
+        """Забывает сегменты, закончившиеся до ``before_frame``."""
+        # Последний сегмент остаётся всегда — для повтора и ресинка
         keep: list[Segment] = []
         for i, seg in enumerate(self._segments):
             later = i + 1

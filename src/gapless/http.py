@@ -1,18 +1,8 @@
-"""HTTP бесшовного потока в DLNA-сервере: поток, обложки, команды.
-
-- ``GET /live/<имя>.wav`` — непрерывный WAV текущей сессии. Проба
-  OwnTone (``Lavf/…``) получает заголовок и секунду тишины, не трогая
-  писатель; плеер (``AirPlay/…``) — поток в темпе. По
-  ``Icy-MetaData: 1`` — ICY: название и обложка (опыт E2).
-  Параметры только в пути: query OwnTone при переподключении теряет.
-- ``GET /cover/<id>.jpg`` — обложка трека через наш сервер: OwnTone
-  берёт обложку из ICY только по ссылке с расширением .jpg.
-- ``POST /gapless/start|segment|end|prepare|stop``, ``GET /gapless/state``
-  — команды менеджера (тот же хост, общие часы ``time.monotonic``).
-"""
+"""HTTP бесшовного потока в DLNA-сервере: поток, обложки, команды."""
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from logging import getLogger
 from typing import AsyncIterator
@@ -20,10 +10,21 @@ from typing import AsyncIterator
 import aiohttp
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 from core.config.settings import settings
+from core.covers import cover_url
 
+from .models import (
+    EndBody,
+    EndReply,
+    GaplessState,
+    OkReply,
+    PrepareBody,
+    SegmentBody,
+    SegmentReply,
+    StartBody,
+    StartReply,
+)
 from .timeline import BYTES_PER_FRAME, SAMPLE_RATE
 from .writer import GaplessSession, IcyInterleaver, icy_block, wav_header
 
@@ -65,16 +66,15 @@ class GaplessHub:
         self.session = None
 
     def remember_cover(self, track_id: str, url: str) -> None:
-        """Ссылка на обложку трека для /cover/<id>.jpg."""
+        """Запоминает ссылку на обложку трека для /cover/<id>.jpg."""
         if url:
-            if url.startswith("avatars."):
-                url = "https://" + url
-            self._cover_urls[track_id] = url.replace("%%", "400x400")
+            self._cover_urls[track_id] = cover_url(url)
 
     def cover_link(self, track_id: str) -> str:
         """Ссылка для ICY StreamUrl (пустая, если обложки нет)."""
         if track_id not in self._cover_urls:
             return ""
+        # OwnTone берёт обложку из ICY только по ссылке с расширением .jpg
         return (
             f"http://{settings.local_server_host}:"
             f"{settings.local_server_port_dlna}/cover/{track_id}.jpg"
@@ -125,56 +125,27 @@ def _require_gapless() -> None:
         )
 
 
-class StartBody(BaseModel):
-    lead: float | None = None
-    margin: float | None = None
-
-
-class SegmentBody(BaseModel):
-    track_id: str
-    t_station: float
-    pos: float
-    url: str = ""
-    title: str = ""
-    artist: str = ""
-    album: str = ""
-    cover: str = ""
-
-
-class EndBody(BaseModel):
-    t_station: float
-
-
-class PrepareBody(BaseModel):
-    track_id: str
-    url: str
-    cover: str = ""
-
-
 @router.post("/gapless/start")
-async def gapless_start(
-    request: Request, body: StartBody
-) -> dict[str, object]:
-    """Новая сессия; возвращает имя потока и якорь t0."""
+async def gapless_start(request: Request, body: StartBody) -> StartReply:
+    """Открывает новую сессию вместо прежней."""
     _require_gapless()
     hub = _hub(request)
     session = hub.start(
         settings.gapless_lead if body.lead is None else body.lead,
         settings.gapless_margin if body.margin is None else body.margin,
     )
-    return {
-        "session": hub.session_name,
-        "stream_path": f"/live/{hub.session_name}.wav",
-        "t0": session.timeline.t0,
-        "w_start": session.w_start,
-    }
+    # Менеджер на том же хосте: часы time.monotonic у сервера общие с ним
+    return StartReply(
+        session=hub.session_name,
+        stream_path=f"/live/{hub.session_name}.wav",
+        t0=session.timeline.t0,
+        w_start=session.w_start,
+    )
 
 
 @router.post("/gapless/segment")
-async def gapless_segment(
-    request: Request, body: SegmentBody
-) -> dict[str, object]:
-    """В момент Станции t_station трек был на позиции pos."""
+async def gapless_segment(request: Request, body: SegmentBody) -> SegmentReply:
+    """Добавляет сегмент: в момент Станции t_station трек на позиции pos."""
     session = _session(request)
     hub = _hub(request)
     hub.remember_cover(body.track_id, body.cover)
@@ -187,44 +158,43 @@ async def gapless_segment(
     seg = session.add_segment(
         body.track_id, body.t_station, body.pos, body.url, meta
     )
-    return {
-        "added": seg is not None,
-        "seg_id": None if seg is None else seg.seg_id,
-    }
+    return SegmentReply(
+        added=seg is not None, seg_id=None if seg is None else seg.seg_id
+    )
 
 
 @router.post("/gapless/end")
-async def gapless_end(request: Request, body: EndBody) -> dict[str, object]:
-    """Тишина с момента Станции t_station."""
+async def gapless_end(request: Request, body: EndBody) -> EndReply:
+    """Закрывает звучащий сегмент: тишина с момента Станции t_station."""
     seg = _session(request).end_segment(body.t_station)
-    return {"ended": None if seg is None else seg.seg_id}
+    return EndReply(ended=None if seg is None else seg.seg_id)
 
 
 @router.post("/gapless/prepare")
-async def gapless_prepare(
-    request: Request, body: PrepareBody
-) -> dict[str, bool]:
-    """Предзапуск декодера следующего трека."""
+async def gapless_prepare(request: Request, body: PrepareBody) -> OkReply:
+    """Предзапускает декодер следующего трека."""
     session = _session(request)
     _hub(request).remember_cover(body.track_id, body.cover)
     session.prepare(body.track_id, body.url)
-    return {"ok": True}
+    return OkReply()
 
 
 @router.post("/gapless/stop")
-async def gapless_stop(request: Request) -> dict[str, bool]:
+async def gapless_stop(request: Request) -> OkReply:
     """Закрывает сессию."""
     _hub(request).stop()
-    return {"ok": True}
+    return OkReply()
 
 
 @router.get("/gapless/state")
-async def gapless_state(request: Request) -> dict[str, object]:
+async def gapless_state(request: Request) -> GaplessState:
     """Состояние сессии (или closed=True, если её нет)."""
     hub = _hub(request)
     if hub.session is None:
-        return {"closed": True}
-    return {"session": hub.session_name, **hub.session.state()}
+        return GaplessState(closed=True)
+    return hub.session.state().model_copy(
+        update={"session": hub.session_name}
+    )
 
 
 @router.get("/cover/{track_id}.jpg")
@@ -232,17 +202,18 @@ async def cover(request: Request, track_id: str) -> Response:
     """Обложка трека для OwnTone (ICY StreamUrl)."""
     try:
         data = await _hub(request).cover(track_id)
-    except Exception as e:
-        logger.warning(f"⚠️ Обложка {track_id}: {e}")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"⚠️ Обложка {track_id}: {e!r}")
         data = None
     if data is None:
         raise HTTPException(status_code=404)
     return Response(content=data, media_type="image/jpeg")
 
 
+# Имя сессии в пути, а не в query: query OwnTone при переподключении теряет
 @router.get("/live/{name}.wav")
 async def live(request: Request, name: str) -> Response:
-    """Непрерывный WAV сессии ``name``."""
+    """Непрерывный WAV сессии ``name``, с ICY по ``Icy-MetaData: 1``."""
     hub = _hub(request)
     session = hub.session
     if session is None or session.closed or name != hub.session_name:
@@ -272,11 +243,7 @@ async def live(request: Request, name: str) -> Response:
 
 
 async def _body(session: GaplessSession, icy: bool) -> AsyncIterator[bytes]:
-    """Тело ответа: заголовок WAV, PCM в темпе, ICY по запросу.
-
-    В тишине (комментарий диджея) описание не стирается — остаётся
-    последнее, пока не зазвучит следующий трек.
-    """
+    """Тело ответа: заголовок WAV, PCM в темпе, ICY по запросу."""
     interleaver = IcyInterleaver() if icy else None
     last: dict[str, str] = {}
     first = True
@@ -286,6 +253,8 @@ async def _body(session: GaplessSession, icy: bool) -> AsyncIterator[bytes]:
         if interleaver is None:
             yield data
             continue
+        # В тишине (комментарий диджея) остаётся последнее описание,
+        # пока не зазвучит следующий трек
         meta = session.meta_at(session.frame - 1) or last
         last = meta
         yield interleaver.feed(data, icy_block(meta, meta.get("cover", "")))

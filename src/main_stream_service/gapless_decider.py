@@ -1,37 +1,13 @@
-"""Решатель бесшовного режима: снимки Станции → действия (план, раздел 0).
-
-Чистая логика без сети и asyncio: на вход — снимок Станции с моментом
-получения (``time.monotonic``), на выход — действия для менеджера.
-
-Режим трека на колонках:
-
-- **синхронный** (``sync``): колонки звучат вровень со Станцией —
-  позиция сегмента сдвинута на задержку D. Пока колонки догоняют
-  (D секунд после события), трек играет сама Станция, затем она гаснет
-  (выбор пользователя 29.10.2026 «подхват Станцией»). Так — после
-  комментария диджея, при старте сессии и на обычном стыке после
-  синхронного трека (Станция заранее громкая — ``pre_end_unmute``);
-- **зеркальный**: колонки повторяют Станцию с задержкой D, Станция
-  приглушена, стык встык. Так — при кроссфейде Станции после
-  синхронного трека (колонки переходят на новый трек без дыры) и на
-  стыках без диджея после зеркального трека.
-
-Сигналы Станции (опыт E5):
-
-- комментарий на естественном стыке: ``alice → NONE`` и
-  ``playing=false`` у конца трека; трек на колонках доигрывает;
-- скип/«назад» с диджеем: ``LISTENING/BUSY → NONE`` при ``playing``
-  и прежнем id — трек на колонках обрывается в момент события;
-- пауза: ``playing=false`` не у конца трека дольше ``pause_confirm``;
-- первые секунды нового трека progress Станции скачет (1 → 0 → 3):
-  в окне ``grace`` допуск ``grace_tolerance``.
-"""
+"""Решатель бесшовного режима: снимки Станции → действия (план, раздел 0)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 LISTEN_STATES = {"LISTENING", "BUSY"}
+
+# Ключ снимка: трек, играет ли, позиция, длительность, состояние Алисы
+SnapshotKey = tuple[str, bool, float, float, str | None]
 
 
 @dataclass(frozen=True)
@@ -55,28 +31,22 @@ class StartSession:
 
 @dataclass(frozen=True)
 class AddSegment:
-    """В момент Станции ``t`` трек ``track_id`` на позиции ``pos``.
-
-    ``sync`` — колонки вровень со Станцией (позицию сдвинуть на D);
-    ``fade_station`` — погасить Станцию, когда колонки зазвучат.
-    """
+    """В момент Станции ``t`` трек ``track_id`` на позиции ``pos``."""
 
     track_id: str
     t: float
     pos: float
-    sync: bool = False
-    fade_station: bool = False
+    sync: bool = False  # колонки вровень со Станцией: позиция + D
+    fade_station: bool = False  # погасить Станцию, когда колонки зазвучат
 
 
 @dataclass(frozen=True)
 class EndSegment:
-    """Тишина на колонках с момента Станции ``t``.
-
-    ``sync`` — текущий трек вровень со Станцией: исполнитель сдвигает
-    момент на D назад, чтобы колонки смолкли вместе со Станцией.
-    """
+    """Тишина на колонках с момента Станции ``t``."""
 
     t: float
+    # Трек вровень со Станцией: момент сдвигается на D назад, чтобы
+    # колонки смолкли вместе со Станцией
     sync: bool = False
 
 
@@ -135,7 +105,13 @@ class GaplessDecider:
 
     session: bool = False
     track_id: str | None = None
-    sync: bool = False  # режим текущего трека
+    # Режим текущего трека. Синхронный: колонки вровень со Станцией,
+    # первые D секунд играет сама Станция, затем гаснет (выбор
+    # пользователя 29.10.2026) — на старте, после диджея и на стыке после
+    # синхронного трека. Зеркальный: колонки повторяют Станцию с
+    # задержкой D, Станция приглушена — после кроссфейда синхронного
+    # трека и на стыках без диджея после зеркального
+    sync: bool = False
     seg_open: bool = False
     anchor_t: float = 0.0
     anchor_pos: float = 0.0
@@ -147,7 +123,7 @@ class GaplessDecider:
     ended_since: float | None = None
     prepared: set[str] = field(default_factory=set)
     last_alice: str | None = None
-    last_key: tuple[object, ...] | None = None
+    last_key: SnapshotKey | None = None
     skipped_id: str | None = None
     skipped_pos: float = 0.0
 
@@ -169,13 +145,16 @@ class GaplessDecider:
         self.station_loud = False
 
     def feed(self, s: Snapshot) -> list[Action]:
-        """Действия по новому снимку Станции.
-
-        Цикл менеджера просыпается и без новых сообщений: тот же снимок
-        с новым временем не несёт информации, а сдвинутое время дало бы
-        ложную «перемотку» — такие снимки пропускаются.
-        """
-        key = (s.track_id, s.playing, s.progress, s.duration, s.alice)
+        """Действия по новому снимку Станции."""
+        # Цикл менеджера просыпается и без новых сообщений: тот же снимок
+        # с новым временем дал бы ложную «перемотку» — пропускаем
+        key: SnapshotKey = (
+            s.track_id,
+            s.playing,
+            s.progress,
+            s.duration,
+            s.alice,
+        )
         if key == self.last_key and s.type != "FmRadio":
             # Только проверки по времени (подтверждение паузы, конец
             # очереди): на паузе Станция шлёт одинаковые снимки
@@ -199,6 +178,10 @@ class GaplessDecider:
         near_end = s.duration > 0 and s.duration - s.progress < self.end_window
         same = s.track_id == self.track_id
 
+        # Сигналы Станции (опыт E5): комментарий на стыке — alice → NONE
+        # и playing=false у конца трека; скип с диджеем — LISTENING → NONE
+        # при playing и прежнем id; пауза — playing=false не у конца
+        # дольше pause_confirm
         if self.session and same and s.alice == "NONE":
             if prev_alice == "LISTENING" and s.playing:
                 # Скип/«назад» с диджеем: LISTENING→NONE без BUSY (E5);
@@ -290,12 +273,7 @@ class GaplessDecider:
         return self._segment(s, start_after)
 
     def _segment(self, s: Snapshot, start_after: float = 0.0) -> list[Action]:
-        """Сегмент по снимку; момент — с поправкой на опоздание события.
-
-        ``start_after`` (кроссфейд, вровень): колонки начинают новый трек,
-        когда у них кончится старый — через ``start_after`` с после
-        стыка на Станции; на шкале потока это на D раньше.
-        """
+        """Сегмент по снимку; момент — с поправкой на опоздание события."""
         self.anchor_t = s.t
         self.anchor_pos = s.progress
         self.seg_open = True
@@ -303,6 +281,9 @@ class GaplessDecider:
         t = s.t - self.event_lag
         pos = s.progress
         if start_after > 0:
+            # Кроссфейд вровень: новый трек — когда у колонок кончится
+            # старый, через start_after после стыка; на шкале потока
+            # это на D раньше
             shift = start_after - self.delay
             t += shift
             pos += shift

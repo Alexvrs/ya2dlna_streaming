@@ -12,9 +12,10 @@ from pydantic import JsonValue
 from core.audio_output import AudioOutput
 from core.backoff import ExponentialBackoff
 from core.config.settings import settings
+from core.covers import cover_url
 from core.enums import AliceState, Codec, TrackType
 from core.http_redirects import try_resolve_redirects
-from main_stream_service.gapless_runner import GaplessRunner
+from main_stream_service.gapless_runner import GaplessOutput, GaplessRunner
 from main_stream_service.yandex_music_api import (
     TrackInfo,
     TrackSource,
@@ -183,7 +184,9 @@ class MainStreamManager:
         self._ruark_outage_announced = False
         # Бесшовный режим (план, раздел 0): только OwnTone, по флагу
         self._gapless_runner: GaplessRunner | None = None
-        if settings.gapless and settings.output_backend == "owntone":
+        if settings.gapless and isinstance(
+            self._ruark_controls, GaplessOutput
+        ):
             self._gapless_runner = GaplessRunner(
                 self._station_controls,
                 self._ruark_controls,
@@ -1435,13 +1438,6 @@ class MainStreamManager:
             self._meta_cache[track_id] = cached
         return cached
 
-    @staticmethod
-    def _cover_url(cover: str | None) -> str:
-        """Ссылка на обложку 400×400 из шаблона с %%."""
-        if not cover:
-            return ""
-        return "https://" + cover.split("://")[-1].replace("%%", "400x400")
-
     async def _track_meta(self, track: Track) -> TrackMeta:
         """Альбом и ссылка на обложку трека для дисплеев колонок.
 
@@ -1453,7 +1449,7 @@ class MainStreamManager:
             info = await self._track_info(track.id)
             album = info.album
             cover = cover or info.cover
-        return {"album": album, "cover": self._cover_url(cover)}
+        return {"album": album, "cover": cover_url(cover)}
 
     async def next_track_info(
         self, timeout: float = NEXT_TRACK_INFO_TIMEOUT
@@ -1481,7 +1477,7 @@ class MainStreamManager:
             "title": info.title,
             "artist": info.artist,
             "album": info.album,
-            "cover": self._cover_url(info.cover),
+            "cover": cover_url(info.cover),
         }
 
     async def _send_track_to_stream_server(

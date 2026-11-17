@@ -42,7 +42,7 @@ async def test_start_refused_for_ruark(monkeypatch):
 async def test_start_segment_state_stop(enabled):
     r = req()
     res = await gh.gapless_start(r, gh.StartBody(lead=1.0, margin=2.0))
-    assert res["stream_path"] == f"/live/{res['session']}.wav"
+    assert res.stream_path == f"/live/{res.session}.wav"
     hub = r.app.state.gapless
     t = hub.session.timeline.t0 + 1.0
     seg = await gh.gapless_segment(
@@ -57,20 +57,20 @@ async def test_start_segment_state_stop(enabled):
             cover="avatars.yandex.net/get-music-content/1/2/%%",
         ),
     )
-    assert seg["added"] is True
+    assert seg.added is True
     # Повтор того же состояния — без нового сегмента
     again = await gh.gapless_segment(
         r, gh.SegmentBody(track_id="42", t_station=t + 1.0, pos=1.0)
     )
-    assert again["added"] is False
+    assert again.added is False
     meta = hub.session.timeline.segments[0].meta
     assert meta["cover"].endswith("/cover/42.jpg")
     assert hub._cover_urls["42"].startswith("https://avatars.yandex.net/")
     assert hub._cover_urls["42"].endswith("/400x400")
     state = await gh.gapless_state(r)
-    assert state["closed"] is False and state["session"] == res["session"]
+    assert state.closed is False and state.session == res.session
     await gh.gapless_stop(r)
-    assert (await gh.gapless_state(r)) == {"closed": True}
+    assert (await gh.gapless_state(r)).closed is True
 
 
 async def test_segment_without_session_is_409(enabled):
@@ -92,7 +92,7 @@ async def test_new_start_closes_old_session(enabled):
 async def test_probe_gets_header_and_silence_only(enabled):
     r = req(headers={"User-Agent": "Lavf/58.45.100"})
     res = await gh.gapless_start(r, gh.StartBody())
-    resp = await gh.live(r, res["session"])
+    resp = await gh.live(r, res.session)
     body = resp.body
     assert body[:4] == b"RIFF"
     assert len(body) == 44 + SAMPLE_RATE * BYTES_PER_FRAME
@@ -111,7 +111,7 @@ async def test_live_unknown_session_404(enabled):
 async def test_live_player_gets_icy_headers(enabled):
     r = req(headers={"User-Agent": "AirPlay/999.0.0", "Icy-MetaData": "1"})
     res = await gh.gapless_start(r, gh.StartBody())
-    resp = await gh.live(r, res["session"])
+    resp = await gh.live(r, res.session)
     assert resp.headers["icy-metaint"] == str(gh.IcyInterleaver().metaint)
     assert resp.media_type == "audio/wav"
 

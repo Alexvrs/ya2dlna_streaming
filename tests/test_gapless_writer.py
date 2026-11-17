@@ -34,6 +34,7 @@ class FakeSource:
         self.total = total
         self.ready = ready
         self.closed = False
+        self.eof = False
         self.taken = []
 
     def take(self, offset, size):
