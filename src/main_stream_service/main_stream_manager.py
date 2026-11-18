@@ -186,7 +186,7 @@ class MainStreamManager:
         # Начало текущей недоступности Ruark (time.monotonic)
         self._ruark_outage_started_at: float | None = None
         self._ruark_outage_announced = False
-        # Бесшовный режим (план, раздел 0): только OwnTone, по флагу
+        # Бесшовный режим: только OwnTone, по флагу
         self._gapless_runner: GaplessRunner | None = None
         if settings.gapless and isinstance(
             self._ruark_controls, GaplessOutput

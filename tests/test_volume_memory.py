@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+from core.config.settings import settings
 from core.enums import AliceState, TrackType
 from main_stream_service.main_stream_manager import (
     MainStreamManager,
@@ -238,8 +239,6 @@ def test_manager_reports_running_state():
 
 
 async def test_start_volume_overrides_saved(monkeypatch):
-    from core.config.settings import settings
-
     monkeypatch.setattr(settings, "start_volume", 10)
     manager, ruark = make_manager(ruark_volume=40)
     manager._volume_store = MagicMock()

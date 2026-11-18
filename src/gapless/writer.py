@@ -188,7 +188,7 @@ class GaplessSession:
         # к записи кадра событие Станции о нём уже пришло (margin покрывает
         # опоздание события и запуск декодера), а OwnTone держит lead
         # секунд впереди слышимого. Задержка D «Станция → колонки» —
-        # lead + margin + буфер OwnTone (~3 с), см. план, раздел 0
+        # lead + margin + буфер OwnTone (~3 с)
         self.timeline = Timeline(self.w_start - lead - margin)
         self.pool = SourcePool(factory)
         self.renderer = Renderer(self.timeline, self.pool)

@@ -1,14 +1,18 @@
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.config.settings import settings
+from core.config.settings import Settings, settings
 from core.enums import AliceState, TrackType
 from yandex_station.protobuf_parser import Protobuf
 from yandex_station.station_controls import YandexStationControls
-from yandex_station.station_ws_control import YandexStationClient
+from yandex_station.station_ws_control import (
+    YandexStationClient,
+    raw_state_line,
+)
 from yandex_station.volume_store import StationVolumeStore
 
 BASE_PLAYER_STATE = {
@@ -136,16 +140,12 @@ async def test_say_sends_repeat_command_to_station():
 
 async def test_alice_fade_is_short_and_immediate(monkeypatch):
     """После речи Алисы станция гаснет сразу и за ~0,5 с."""
-    import asyncio as _asyncio
-
-    from yandex_station.station_controls import YandexStationControls
-
     sleeps = []
 
     async def fake_sleep(delay, *args, **kwargs):
         sleeps.append(delay)
 
-    monkeypatch.setattr(_asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     # Без переноса голосовой громкости паузы перед гашением нет
     monkeypatch.setattr(settings, "voice_volume_to_ruark", False)
     controls = YandexStationControls.__new__(YandexStationControls)
@@ -175,10 +175,6 @@ async def test_alice_fade_is_short_and_immediate(monkeypatch):
 
 def test_raw_state_line_keeps_player_and_alice_state():
     """Сырой журнал: время прихода, Алиса, плеер; без appState."""
-    import json
-
-    from yandex_station.station_ws_control import raw_state_line
-
     data = {
         "state": {
             "aliceState": "SPEAKING",
@@ -203,8 +199,6 @@ def test_raw_state_line_keeps_player_and_alice_state():
 
 
 def test_raw_station_log_off_by_default():
-    from core.config.settings import Settings
-
     assert Settings().station_raw_log is False
 
 

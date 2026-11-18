@@ -68,8 +68,8 @@ class Settings(BaseSettings):
     station_raw_log: bool = False
 
     # Бесшовный поток (только output_backend=owntone): один непрерывный
-    # WAV в OwnTone, треки по расписанию Станции с задержкой D (план,
-    # раздел 0). По умолчанию выключен — классический путь
+    # WAV в OwnTone, треки по расписанию Станции с задержкой D.
+    # По умолчанию выключен — классический путь
     gapless: bool = False
     # Писатель опережает реальное время не больше чем на lead секунд
     gapless_lead: float = 1.0
